@@ -26,7 +26,7 @@ what each one is for). In particular:
 ### 2. Bring up everything except the collector
 
 ```bash
-docker compose up -d bindplane elasticsearch kibana_settings kibana litellm db prometheus langfuse-web langfuse-worker clickhouse minio redis postgres tracepump
+docker compose up -d bindplane transform bindplane-prometheus elasticsearch kibana_settings kibana litellm db prometheus langfuse-web langfuse-worker clickhouse minio redis postgres tracepump-init tracepump
 ```
 
 `bdot-collector` is deliberately omitted: it depends on `bindplane`, and
@@ -52,10 +52,13 @@ Expected `STATUS` column:
 | `minio` | `Up (healthy)` |
 | `redis` | `Up (healthy)` |
 | `postgres` | `Up (healthy)` |
-| `bindplane` | `Up (healthy)` -- only once `BINDPLANE_LICENSE` is a real, valid license |
+| `transform` | `Up` (no healthcheck defined) -- required for `bindplane` to start at all; see the comment on the `transform` service in `docker-compose.yml` |
+| `bindplane-prometheus` | `Up` (no healthcheck defined) -- required for the Overview and Agents pages to render at all, not just for throughput graphs; see the comment on `BINDPLANE_PROMETHEUS_ENABLE` in `docker-compose.yml` |
+| `bindplane` | `Up (healthy)` -- works even with `BINDPLANE_LICENSE` left blank; a garbage (non-empty but invalid) value will crash it instead |
 | `elasticsearch` | `Up (healthy)` |
 | `kibana_settings` | `Exited (0)` -- this is a one-shot bootstrap job, not a long-running service |
 | `kibana` | `Up (healthy)` |
+| `tracepump-init` | `Exited (0)` -- one-shot; fixes `tracepump_data` volume ownership before `tracepump` starts |
 | `tracepump` | `Up` (no healthcheck; see below) |
 
 For any service reporting `unhealthy`, get details with:
@@ -189,6 +192,36 @@ Every host port this compose file claims, all bound to `127.0.0.1` only:
 
 ## Troubleshooting
 
+### Bindplane UI shows "Oops! Something went wrong", or "Failed to load destinations traces summary data"
+
+This happens on every page (Overview, Agents, even after logout) if
+`bindplane-prometheus` isn't running. Despite what Bindplane's own docs
+imply, `BINDPLANE_PROMETHEUS_ENABLE=false` does not just leave throughput
+graphs empty -- confirmed by querying the Overview/Agents GraphQL queries
+directly, the real underlying error is:
+
+```
+dial tcp [::1]:9090: connect: connection refused
+```
+
+i.e. Bindplane unconditionally tries to reach Prometheus for these pages'
+summary widgets. `docker-compose.yml` now runs `bindplane-prometheus` and
+sets `BINDPLANE_PROMETHEUS_ENABLE=true` for exactly this reason -- if you see
+this error, check `docker compose ps bindplane-prometheus` first.
+
+You can confirm this diagnosis directly against the API without touching the
+browser at all:
+
+```bash
+curl -s -u "admin:$BINDPLANE_PASSWORD" -X POST http://localhost:3001/v1/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ destinationsSummary(period: \"1h\", interval: \"1m\", telemetryType: \"logs\", filterGateways: false) { destinationName } }"}'
+```
+
+An empty `{"data":{"destinationsSummary":[]}}` means it's working; a
+`connection refused` error in the response means `bindplane-prometheus` is
+down or unreachable.
+
 ### `bdot-collector` can't reach OpAMP
 
 Symptoms: the container restart-loops; `docker compose logs bdot-collector`
@@ -253,6 +286,30 @@ destination in Phase 2, step 7.
   `docker compose ps elasticsearch` and `docker compose logs elasticsearch`
   first -- a still-starting or unhealthy Elasticsearch is the more common
   cause than a Bindplane misconfiguration.
+
+### Elasticsearch stuck `unhealthy` after running `docker compose up -d` with `ELASTIC_PASSWORD` blank
+
+This happens if you brought the stack up before filling in `.env` (skipping
+Phase 1, step 1). Elasticsearch only applies `ELASTIC_PASSWORD` when it first
+bootstraps its security realm on that volume -- **filling in `.env` after the
+fact does not retroactively change it**, because the `elastic` user's
+password is already fixed in `elasticsearch_data`. Recreating the container
+alone won't help either. Two ways out:
+
+- **Reset in place (keeps any indexed data):**
+  ```bash
+  docker exec elasticsearch /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -a -f -b
+  ```
+  This prints a new password to stdout -- copy it into `.env` as
+  `ELASTIC_PASSWORD` (it will not match whatever you originally wrote there),
+  then `docker compose up -d` again so the healthcheck picks up the new value.
+- **Start over (fine if the volume has nothing worth keeping yet):**
+  ```bash
+  docker compose down elasticsearch
+  docker volume rm wiretap_elasticsearch_data
+  docker compose up -d elasticsearch
+  ```
+  With `ELASTIC_PASSWORD` already correct in `.env` at this point, it bootstraps clean.
 
 ## `docker compose down -v` warning
 
