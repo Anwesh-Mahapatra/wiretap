@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+
+	"wiretap/internal/env"
 )
 
 const (
@@ -111,46 +114,6 @@ func loadWiretapKey() (string, error) {
 	return key, nil
 }
 
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// loadDotEnv populates the environment from a simple KEY="value" file, one
-// assignment per line. Existing environment variables always take
-// precedence. Missing file is not an error since .env is optional.
-func loadDotEnv(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("reading %q: %w", path, err)
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"'`)
-
-		if _, exists := os.LookupEnv(key); !exists {
-			os.Setenv(key, value)
-		}
-	}
-	return nil
-}
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -159,7 +122,7 @@ func main() {
 }
 
 func run() error {
-	if err := loadDotEnv(defaultEnvFile); err != nil {
+	if err := env.LoadDotEnv(defaultEnvFile); err != nil {
 		return err
 	}
 
@@ -173,17 +136,22 @@ func run() error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	defer cancel()
-
 	// LiteLLM proxies to Groq and reports telemetry to Langfuse itself
 	// (see litellm_settings.success_callback in config.yaml), so no Go-side
 	// tracing middleware is needed here anymore.
 	client := openai.NewClient(
-		option.WithBaseURL(envOrDefault("LITELLM_BASE_URL", defaultLiteLLMURL)),
+		option.WithBaseURL(env.OrDefault("LITELLM_BASE_URL", defaultLiteLLMURL)),
 		option.WithAPIKey(apiKey),
 		option.WithMiddleware(dumpRequestMiddleware),
 	)
+
+	type result struct {
+		name       string
+		ok         bool
+		httpStatus int
+		err        error
+	}
+	results := make([]result, 0, len(sf.Scenarios))
 
 	for _, sc := range sf.Scenarios {
 		messages := make([]openai.ChatCompletionMessageParamUnion, len(sc.Messages))
@@ -199,18 +167,45 @@ func run() error {
 			params.MaxTokens = openai.Int(*sc.MaxTokens)
 		}
 
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		resp, err := client.Chat.Completions.New(ctx, params,
 			option.WithJSONSet("metadata.trace_user_id", sf.Defaults.UserID),
-			option.WithJSONSet("metadata.session_id", "module3"),
+			option.WithJSONSet("metadata.session_id", sf.Defaults.SessionID),
 			option.WithJSONSet("metadata.tags", sc.Tags),
 			option.WithJSONSet("metadata.trace_name", "wiretap-"+sc.Name),
 		)
+		cancel()
 		if err != nil {
-			return fmt.Errorf("scenario %q: sending request: %w", sc.Name, err)
+			res := result{name: sc.Name, err: fmt.Errorf("sending request: %w", err)}
+			if apiErr, ok := errors.AsType[*openai.Error](err); ok {
+				res.httpStatus = apiErr.StatusCode
+			}
+			results = append(results, res)
+			fmt.Fprintf(os.Stderr, "scenario %q: %v\n", sc.Name, res.err)
+			continue
 		}
 
 		fmt.Printf("=== %s ===\n%s\n", sc.Name, resp.Choices[0].Message.Content)
+		results = append(results, result{name: sc.Name, ok: true, httpStatus: http.StatusOK})
 	}
 
+	fmt.Println("\n=== summary ===")
+	failed := false
+	for _, r := range results {
+		status := "ok"
+		if !r.ok {
+			status = "failed"
+			failed = true
+		}
+		if r.httpStatus != 0 {
+			fmt.Printf("%-12s %-7s http=%d\n", r.name, status, r.httpStatus)
+		} else {
+			fmt.Printf("%-12s %-7s http=(none)\n", r.name, status)
+		}
+	}
+
+	if failed {
+		return fmt.Errorf("one or more scenarios failed")
+	}
 	return nil
 }

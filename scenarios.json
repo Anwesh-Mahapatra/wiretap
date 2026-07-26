@@ -2,7 +2,7 @@
   "defaults": {
     "model": "llama-3.3-70b-versatile",
     "userId": "anwesh-lab",
-    "sessionId": "module2"
+    "sessionId": "module4"
   },
   "scenarios": [
     {

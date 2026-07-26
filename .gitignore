@@ -1,2 +1,6 @@
 api_key
 .env
+*.ndjson
+/data/
+tracepump-state.json
+/wiretap

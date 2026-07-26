@@ -1,9 +1,7 @@
-//go:build ignore
-
 // tracescope fetches a single Langfuse trace via the public API and prints a
 // flattened, human-readable view of it.
 //
-// Usage: go run tracescope.go <traceId>
+// Usage: go run ./cmd/tracescope <traceId>
 package main
 
 import (
@@ -14,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"wiretap/internal/env"
 )
 
 const (
@@ -51,46 +51,6 @@ type apiTrace struct {
 	Output       any              `json:"output"`
 	Latency      float64          `json:"latency"`
 	Observations []apiObservation `json:"observations"`
-}
-
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// loadDotEnv populates the environment from a simple KEY="value" file, one
-// assignment per line. Existing environment variables always take
-// precedence. Missing file is not an error since .env is optional.
-func loadDotEnv(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("reading %q: %w", path, err)
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"'`)
-
-		if _, exists := os.LookupEnv(key); !exists {
-			os.Setenv(key, value)
-		}
-	}
-	return nil
 }
 
 func fetchTrace(baseURL, publicKey, secretKey, traceID string) (*apiTrace, error) {
@@ -175,7 +135,7 @@ func printTrace(t *apiTrace) {
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: go run tracescope.go <traceId>")
+		fmt.Fprintln(os.Stderr, "usage: go run ./cmd/tracescope <traceId>")
 		os.Exit(1)
 	}
 	traceID := os.Args[1]
@@ -187,7 +147,7 @@ func main() {
 }
 
 func run(traceID string) error {
-	if err := loadDotEnv(defaultEnvFile); err != nil {
+	if err := env.LoadDotEnv(defaultEnvFile); err != nil {
 		return err
 	}
 
@@ -196,7 +156,12 @@ func run(traceID string) error {
 	if publicKey == "" || secretKey == "" {
 		return fmt.Errorf("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set (in the environment or .env)")
 	}
-	baseURL := envOrDefault("LANGFUSE_BASE_URL", defaultLangfuseURL)
+	// Run from the host, so this points at the published port, unlike the
+	// tracepump container which must use http://langfuse-web:3000 instead
+	// (see docker-compose.yml and RUNBOOK.md) since "localhost" inside that
+	// container would mean the container itself, not the langfuse-web
+	// service.
+	baseURL := env.OrDefault("LANGFUSE_BASE_URL", defaultLangfuseURL)
 
 	trace, err := fetchTrace(baseURL, publicKey, secretKey, traceID)
 	if err != nil {
