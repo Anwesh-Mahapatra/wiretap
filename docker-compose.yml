@@ -22,17 +22,10 @@ services:
       # is auto-refreshed alongside the writer.
       # DATABASE_URL_READ_REPLICA: "postgresql://llmproxy:dbpassword9090@db-reader:5432/litellm"
       STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
-      # Pushes request/response spans for the "otel" success/failure_callback
-      # (see config.yaml) to the BDOT Collector's OTLP HTTP receiver. This is
-      # spans, not log records -- the operator decides in the Bindplane UI how
-      # to route/shape them alongside the Langfuse content-layer data.
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://bdot-collector:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     env_file:
       - .env # Load local .env file (shared with the wiretap Go program)
     depends_on:
-      - db             # Indicates that this service depends on the 'db' service, ensuring 'db' starts first
-      - bdot-collector # OTLP spans are pushed to the collector; see OTEL_EXPORTER_OTLP_ENDPOINT above
+      - db # Indicates that this service depends on the 'db' service, ensuring 'db' starts first
     # Explicit rotation limits so LiteLLM's structured JSON stdout logs (the
     # container stdout log source referenced in RUNBOOK.md) can't fill the
     # disk.
@@ -243,134 +236,6 @@ services:
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
 
-  # --- Bindplane pipeline (Module 4) -----------------------------------------
-  # These services move raw gateway (LiteLLM) and content (Langfuse) telemetry
-  # into a Bindplane OP server and BDOT Collector so the operator can wire up
-  # ECS mapping / Elasticsearch routing by hand in the Bindplane UI. Nothing
-  # here does any field shaping.
-
-  # Confirmed by trial run: bindplane 1.89.5 will not start at all without a
-  # transform agent available -- neither BINDPLANE_TRANSFORM_AGENT_ENABLE_REMOTE:
-  # "false" (fails validating the remote-agent list) nor pre-creating an empty
-  # /data/transform-agents folder (it then fails with "no transform agent
-  # binaries found") gets past server startup. A real transform agent,
-  # pointed to remotely, is the only configuration that actually boots
-  # cleanly -- verified by trial run with a dummy license, where this is the
-  # only setup that gets past "failed to create transform manager" and
-  # reaches (the expected, license-related) next error.
-  transform:
-    container_name: bindplane-transform-agent
-    image: ghcr.io/observiq/bindplane-transform-agent:1.89.5-bindplane
-    restart: unless-stopped
-
-  # Required for the Overview/Agents pages to render at all (see the comment
-  # on BINDPLANE_PROMETHEUS_ENABLE below) -- not just for throughput graphs.
-  # Verified this exact image tag against Bindplane's own docker-compose
-  # example.
-  bindplane-prometheus:
-    container_name: bindplane-prometheus
-    image: ghcr.io/observiq/bindplane-prometheus:1.89.5
-    restart: unless-stopped
-    volumes:
-      - bindplane_prometheus_data:/prometheus
-
-  bindplane:
-    container_name: bindplane
-    # Verified against https://docs.bindplane.com/deployment/docker (its own
-    # quick-start docker-compose example pins this exact tag) and against the
-    # ghcr.io registry manifest API on 2026-07-26.
-    image: ghcr.io/observiq/bindplane-ee:1.89.5
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:3001:3001" # Web UI + OpAMP endpoint (documented)
-      - "127.0.0.1:3002:3002" # Listed as a required port in the docs' overview page; unused by this single-node bbolt setup but reserved in case a future Bindplane version binds it
-    environment:
-      BINDPLANE_LICENSE: ${BINDPLANE_LICENSE}
-      BINDPLANE_USERNAME: ${BINDPLANE_USERNAME}
-      BINDPLANE_PASSWORD: ${BINDPLANE_PASSWORD}
-      BINDPLANE_SESSION_SECRET: ${BINDPLANE_SESSION_SECRET}
-      BINDPLANE_REMOTE_URL: ${BINDPLANE_REMOTE_URL}
-      BINDPLANE_ACCEPT_EULA: "true"
-      BINDPLANE_LOG_OUTPUT: stdout
-      # The server defaults to binding 127.0.0.1 *inside its own container*
-      # (see the docs' "Host" section), which would make both the published
-      # port and the bdot-collector's ws://bindplane:3001 OpAMP connection
-      # unreachable. Must bind all interfaces.
-      BINDPLANE_HOST: "0.0.0.0"
-      # bbolt avoids a dedicated Postgres container on this memory-constrained
-      # host. Per the docs this store type is deprecated (Postgres is the
-      # recommended backend going forward) but it remains supported today.
-      BINDPLANE_STORE_TYPE: bbolt
-      # See the comment on the "transform" service above: this server will
-      # not start without a transform agent, so it points at the sidecar
-      # rather than trying to disable the feature.
-      BINDPLANE_TRANSFORM_AGENT_ENABLE_REMOTE: "true"
-      BINDPLANE_TRANSFORM_AGENT_REMOTE_AGENTS: transform:4568
-      # Confirmed by direct API testing: leaving this disabled does NOT just
-      # leave throughput graphs empty as the docs imply -- the Overview and
-      # Agents pages unconditionally query Prometheus for their summary
-      # widgets and hard-fail the whole page ("dial tcp [::1]:9090: connect:
-      # connection refused") when it's unset. Prometheus is required for the
-      # UI to function at all, not just for graphs.
-      BINDPLANE_PROMETHEUS_ENABLE: "true"
-      BINDPLANE_PROMETHEUS_ENABLE_REMOTE: "true"
-      BINDPLANE_PROMETHEUS_HOST: bindplane-prometheus
-      BINDPLANE_PROMETHEUS_PORT: "9090"
-    depends_on:
-      - transform
-      - bindplane-prometheus
-    volumes:
-      - bindplane_data:/data # bbolt store, logs, and the agent-upgrade cache all live under /data (confirmed via `bindplane serve --help` flag defaults)
-    healthcheck:
-      # wget is provided by busybox in this Alpine-based image (confirmed by
-      # inspecting the image). This checks that the UI is actually answering
-      # HTTP requests, not merely that the process started -- license
-      # validation happens before the HTTP server comes up, so a bad license
-      # will still show as unhealthy rather than falsely "running".
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  bdot-collector:
-    container_name: bdot-collector
-    hostname: bdot-collector
-    # Verified: matches the exact tag used in Bindplane's own "Install BDOT
-    # Collector in Docker Compose" example, and resolves against the ghcr.io
-    # registry manifest API on 2026-07-26.
-    image: ghcr.io/observiq/bindplane-agent:1.84.0
-    restart: unless-stopped
-    depends_on:
-      - bindplane
-    ports:
-      - "127.0.0.1:4317:4317"   # OTLP gRPC
-      - "127.0.0.1:4318:4318"   # OTLP HTTP
-      - "127.0.0.1:13133:13133" # Health check extension
-    environment:
-      # ws, not wss -- TLS is not configured on the bindplane service in this
-      # lab stack.
-      OPAMP_ENDPOINT: ws://bindplane:3001/v1/opamp
-      OPAMP_SECRET_KEY: ${OPAMP_SECRET_KEY}
-      MANAGER_YAML_PATH: /etc/otel/storage/manager.yaml
-    volumes:
-      - bdot_collector_storage:/etc/otel/storage
-      # Shared with the tracepump service, which writes the Langfuse NDJSON
-      # export here read-write. The collector only ever reads it, so it gets
-      # the volume read-only.
-      - tracepump_data:/data:ro
-      # Uncomment to let a Bindplane File source tail LiteLLM's Docker
-      # stdout JSON log (see RUNBOOK.md for the exact path pattern and how to
-      # find it). WARNING: /var/lib/docker/containers holds every container's
-      # logs on this host, not just LiteLLM's -- this grants the collector
-      # read access to all of them, so only enable it if that's acceptable.
-      # - /var/lib/docker/containers:/var/lib/docker/containers:ro
-    # OPAMP_SECRET_KEY does not exist yet: it's generated by Bindplane when the
-    # operator creates a collector installation in the UI (see RUNBOOK.md
-    # Phase 2). Until that value is in .env, this container will start,
-    # immediately fail to authenticate to Bindplane, and restart-loop. That is
-    # expected on a cold first boot, not a bug.
-
   # One-shot: the tracepump image's distroless "nonroot" base runs as
   # UID/GID 65532, but Docker creates a brand-new named volume owned by
   # root:root -- confirmed by inspecting a fresh tracepump_data volume, which
@@ -384,10 +249,22 @@ services:
     volumes:
       - tracepump_data:/data
 
+  # Same fix, same reasoning, for wiretapd's own state volume -- confirmed
+  # by trial run: wiretapd crash-looped identically on
+  # "/state/wiretapd-index-state.json.tmp: permission denied" against a
+  # freshly created wiretapd_state volume until this ran first.
+  wiretapd-init:
+    image: busybox
+    restart: "no"
+    command: ["chown", "65532:65532", "/state"]
+    volumes:
+      - wiretapd_state:/state
+
   tracepump:
     build:
       context: .
       dockerfile: Dockerfile
+      target: tracepump
     restart: unless-stopped
     depends_on:
       langfuse-web:
@@ -410,13 +287,76 @@ services:
       # trace from scratch each time.
       TRACEPUMP_STATE: /data/tracepump-state.json
     volumes:
-      - tracepump_data:/data # read-write here; bdot-collector mounts the same volume read-only
+      - tracepump_data:/data # read-write here; wiretapd (see below) mounts the same volume, read-only when it isn't the one fetching
+
+  # --- wiretapd: the ingestion daemon ------------------------------------------
+  # Fetches (unless --no-fetch), archives, maps to ECS, and bulk-indexes into
+  # Elasticsearch -- see internal/pipeline and cmd/wiretapd. Defaults to
+  # --no-fetch because tracepump (above) already polls Langfuse and writes
+  # the archive; running a second fetcher here too would just double the API
+  # calls against Langfuse for no benefit.
+  wiretapd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: wiretapd
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_started
+      wiretapd-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # Same reasoning as tracepump's LANGFUSE_BASE_URL override above:
+      # inside this container, "localhost" means this container itself,
+      # not the langfuse-web/elasticsearch services -- must use the
+      # Compose service names instead. This is the single most common
+      # local-vs-container mistake in this stack: getting it wrong doesn't
+      # fail loudly, it just times out with a confusing connection-refused
+      # against a port that works fine from the host.
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      # LANGFUSE_PUBLIC_URL, by contrast, is deliberately NOT the internal
+      # service name: internal/ecs uses it only to build event.reference
+      # links that an *analyst's own browser* clicks from a Kibana alert,
+      # so it must be whatever URL that browser can actually reach -- the
+      # published host port, not the in-container hostname. If you reach
+      # this stack from somewhere other than the Docker host itself,
+      # override this in .env to match.
+      LANGFUSE_PUBLIC_URL: http://localhost:3000
+      # Kept in a separate volume from the archive -- see the /state
+      # volume comment below.
+      WIRETAPD_INDEX_STATE: /state/wiretapd-index-state.json
+      WIRETAPD_FETCH_STATE: /state/wiretapd-fetch-state.json
+    volumes:
+      # Read-only: this service defaults to --no-fetch (see "command"
+      # below), so it only ever reads /data, never writes the archive. If
+      # you switch it to running its own fetch stage instead of
+      # tracepump's, change this to read-write.
+      - tracepump_data:/data:ro
+      # wiretapd's own checkpoint(s) live here, not in tracepump_data,
+      # specifically so they can always be written regardless of whether
+      # the /data mount above is read-only -- a read-only /data would
+      # otherwise make persisting the index checkpoint impossible even
+      # though wiretapd never needs to write the archive itself.
+      - wiretapd_state:/state
+    # To run wiretapd's own fetch stage instead of relying on tracepump:
+    # stop the tracepump service, change the /data mount above to
+    # read-write, and change this command to just ["run"] (drop --no-fetch).
+    # To run wiretapd standalone from the host instead of as a container
+    # at all (e.g. for `bootstrap`/`check`/`backfill` during development),
+    # see RUNBOOK.md -- LANGFUSE_BASE_URL and ELASTICSEARCH_URL default to
+    # localhost there, matching tracescope's own convention.
+    command: ["run", "--no-fetch"]
 
   # --- Elasticsearch destination (local) --------------------------------------
-  # Single-node, security-enabled ES + Kibana for the operator to build
-  # detection rules against. No index templates, ILM policies, data views, or
-  # mappings are created here -- that's the operator's work in the Kibana UI,
-  # same as the rest of the Bindplane pipeline configuration.
+  # Single-node, security-enabled ES + Kibana. wiretapd owns index template
+  # creation and field mapping (internal/esink) -- no dynamic mapping, no
+  # UI-driven schema setup.
   #
   # Config pattern (image tags, security env vars, the kibana_settings
   # bootstrap step) verified on 2026-07-26 against Elastic's own local dev
@@ -529,13 +469,9 @@ volumes:
     driver: local
   langfuse_redis_data:
     driver: local
-  bindplane_data:
-    driver: local
-  bindplane_prometheus_data:
-    driver: local
-  bdot_collector_storage:
-    driver: local
   tracepump_data:
+    driver: local
+  wiretapd_state:
     driver: local
   elasticsearch_data:
     driver: local

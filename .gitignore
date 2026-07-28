@@ -2,5 +2,12 @@ api_key
 .env
 *.ndjson
 /data/
-tracepump-state.json
+*-state.json
+dead-letter*.json
+
+# Stray binaries from an accidental `go build ./...` at the repo root
+# (this has happened before -- see git history) -- one per cmd/ package.
 /wiretap
+/tracepump
+/tracescope
+/wiretapd

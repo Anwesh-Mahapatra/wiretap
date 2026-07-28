@@ -5,85 +5,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"wiretap/internal/env"
+	"wiretap/internal/langfuse"
 )
 
 const (
 	defaultEnvFile     = ".env"
 	defaultLangfuseURL = "http://localhost:3000"
+	requestTimeout     = 15 * time.Second
 )
-
-type apiUsage struct {
-	Input  int    `json:"input"`
-	Output int    `json:"output"`
-	Total  int    `json:"total"`
-	Unit   string `json:"unit"`
-}
-
-type apiObservation struct {
-	ID        string    `json:"id"`
-	Type      string    `json:"type"`
-	Name      string    `json:"name"`
-	Model     string    `json:"model"`
-	Input     any       `json:"input"`
-	Output    any       `json:"output"`
-	Usage     *apiUsage `json:"usage"`
-	Latency   float64   `json:"latency"`
-	StartTime string    `json:"startTime"`
-	EndTime   string    `json:"endTime"`
-}
-
-type apiTrace struct {
-	ID           string           `json:"id"`
-	Name         string           `json:"name"`
-	UserID       string           `json:"userId"`
-	SessionID    string           `json:"sessionId"`
-	Tags         []string         `json:"tags"`
-	Input        any              `json:"input"`
-	Output       any              `json:"output"`
-	Latency      float64          `json:"latency"`
-	Observations []apiObservation `json:"observations"`
-}
-
-func fetchTrace(baseURL, publicKey, secretKey, traceID string) (*apiTrace, error) {
-	url := fmt.Sprintf("%s/api/public/traces/%s", strings.TrimRight(baseURL, "/"), traceID)
-
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.SetBasicAuth(publicKey, secretKey)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("langfuse API returned status %s: %s", resp.Status, body)
-	}
-
-	var trace apiTrace
-	if err := json.Unmarshal(body, &trace); err != nil {
-		return nil, fmt.Errorf("parsing response: %w", err)
-	}
-	return &trace, nil
-}
 
 func printJSONField(label string, v any) {
 	if v == nil {
@@ -98,13 +35,54 @@ func printJSONField(label string, v any) {
 	fmt.Printf("%s:\n    %s\n", label, b)
 }
 
-func printTrace(t *apiTrace) {
+// outcomeTags are wiretap's mutually-exclusive scenario labels (see
+// scenarios.json). A single chat-completion request produces exactly one of
+// these; a trace carrying more than one has had requests merged into it.
+var outcomeTags = []string{"benign", "injection", "truncated"}
+
+// warnIfMerged prints a loud warning if t shows symptoms of the
+// id-equals-session-id merged-trace bug (see notes.md): LiteLLM falling
+// back to session_id as the trace ID whenever a caller doesn't set an
+// explicit trace_id. A merged trace pairs input from one request with
+// output from another, so its input/output correlation, tags, and latency
+// cannot be trusted for anything -- including detection rules.
+func warnIfMerged(t *langfuse.Trace) {
+	if t.ID == t.SessionID {
+		fmt.Printf("WARNING: trace id equals session id (%q). This trace is a merged\n", t.ID)
+		fmt.Println("  artifact, not a single request: LiteLLM fell back to session_id as the")
+		fmt.Println("  trace ID, so observations from every request sharing this session may have")
+		fmt.Println("  been written into it. Its input/output pairing cannot be trusted -- the")
+		fmt.Println("  input shown below may belong to a different request than the output.")
+		fmt.Println()
+	}
+
+	var found []string
+	for _, outcome := range outcomeTags {
+		for _, tag := range t.Tags {
+			if tag == outcome {
+				found = append(found, outcome)
+				break
+			}
+		}
+	}
+	if len(found) > 1 {
+		fmt.Printf("WARNING: trace carries %d mutually-exclusive outcome tags (%s).\n", len(found), strings.Join(found, ", "))
+		fmt.Println("  A single request produces exactly one of benign/injection/truncated, so")
+		fmt.Println("  this trace has accumulated tags from more than one request. Its tags")
+		fmt.Println("  cannot be used to identify which scenario produced the input/output below.")
+		fmt.Println()
+	}
+}
+
+func printTrace(t *langfuse.Trace) {
 	fmt.Printf("trace id:   %s\n", t.ID)
 	fmt.Printf("name:       %s\n", t.Name)
 	fmt.Printf("userId:     %s\n", t.UserID)
 	fmt.Printf("sessionId:  %s\n", t.SessionID)
 	fmt.Printf("tags:       %s\n", strings.Join(t.Tags, ", "))
 	fmt.Println()
+
+	warnIfMerged(t)
 
 	generations := 0
 	for _, obs := range t.Observations {
@@ -163,8 +141,16 @@ func run(traceID string) error {
 	// service.
 	baseURL := env.OrDefault("LANGFUSE_BASE_URL", defaultLangfuseURL)
 
-	trace, err := fetchTrace(baseURL, publicKey, secretKey, traceID)
+	client := langfuse.New(baseURL, publicKey, secretKey, langfuse.WithUserAgent("wiretap-tracescope"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	trace, err := client.GetTrace(ctx, traceID)
 	if err != nil {
+		if langfuse.IsNotFound(err) {
+			return fmt.Errorf("no trace with id %q", traceID)
+		}
 		return err
 	}
 

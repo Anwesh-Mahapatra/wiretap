@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,21 @@ func toChatMessage(m scenarioMessage) openai.ChatCompletionMessageParamUnion {
 	default:
 		return openai.UserMessage(m.Content)
 	}
+}
+
+// newTraceID returns a fresh, scenario-prefixed identifier for use as
+// metadata.trace_id, e.g. "injection-3f9a2c8b1d4e5f60...". The scenario name
+// prefix lets an analyst read the scenario straight off a trace ID when
+// pivoting from a Kibana alert into the Langfuse UI, without an extra
+// lookup. 16 random bytes (128 bits) from crypto/rand is more than enough
+// entropy to guarantee a fresh ID on every call, including reruns of the
+// same scenario.
+func newTraceID(scenarioName string) (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating trace id: %w", err)
+	}
+	return fmt.Sprintf("%s-%x", scenarioName, b), nil
 }
 
 var authHeaderRe = regexp.MustCompile(`(?i)^(Authorization:\s*Bearer\s+).+$`)
@@ -149,11 +165,23 @@ func run() error {
 		name       string
 		ok         bool
 		httpStatus int
+		traceID    string
 		err        error
 	}
 	results := make([]result, 0, len(sf.Scenarios))
 
 	for _, sc := range sf.Scenarios {
+		traceID, err := newTraceID(sc.Name)
+		if err != nil {
+			return fmt.Errorf("scenario %q: %w", sc.Name, err)
+		}
+		// Fail loudly rather than silently repeating the merged-trace bug:
+		// if this ever matches the shared session ID, LiteLLM's Langfuse
+		// callback would collapse every scenario back into one trace.
+		if traceID == sf.Defaults.SessionID {
+			return fmt.Errorf("scenario %q: generated trace id %q equals session id %q -- refusing to send, this would merge traces again", sc.Name, traceID, sf.Defaults.SessionID)
+		}
+
 		messages := make([]openai.ChatCompletionMessageParamUnion, len(sc.Messages))
 		for i, m := range sc.Messages {
 			messages[i] = toChatMessage(m)
@@ -173,20 +201,30 @@ func run() error {
 			option.WithJSONSet("metadata.session_id", sf.Defaults.SessionID),
 			option.WithJSONSet("metadata.tags", sc.Tags),
 			option.WithJSONSet("metadata.trace_name", "wiretap-"+sc.Name),
+			// Without this, LiteLLM's Langfuse callback derives the trace ID
+			// from session_id instead. Since session_id is intentionally
+			// shared across a whole run (and across reruns, per
+			// scenarios.json), every scenario -- and every prior run using
+			// the same session ID -- would collapse into a single Langfuse
+			// trace: input/output pairs from different requests get
+			// shuffled together, tags become the union of every outcome,
+			// and latency spans days instead of one request. This is not
+			// hypothetical; it already happened once. See notes.md.
+			option.WithJSONSet("metadata.trace_id", traceID),
 		)
 		cancel()
 		if err != nil {
-			res := result{name: sc.Name, err: fmt.Errorf("sending request: %w", err)}
+			res := result{name: sc.Name, traceID: traceID, err: fmt.Errorf("sending request: %w", err)}
 			if apiErr, ok := errors.AsType[*openai.Error](err); ok {
 				res.httpStatus = apiErr.StatusCode
 			}
 			results = append(results, res)
-			fmt.Fprintf(os.Stderr, "scenario %q: %v\n", sc.Name, res.err)
+			fmt.Fprintf(os.Stderr, "scenario %q: trace=%s: %v\n", sc.Name, traceID, res.err)
 			continue
 		}
 
-		fmt.Printf("=== %s ===\n%s\n", sc.Name, resp.Choices[0].Message.Content)
-		results = append(results, result{name: sc.Name, ok: true, httpStatus: http.StatusOK})
+		fmt.Printf("=== %s (trace=%s) ===\n%s\n", sc.Name, traceID, resp.Choices[0].Message.Content)
+		results = append(results, result{name: sc.Name, ok: true, httpStatus: http.StatusOK, traceID: traceID})
 	}
 
 	fmt.Println("\n=== summary ===")
@@ -198,9 +236,9 @@ func run() error {
 			failed = true
 		}
 		if r.httpStatus != 0 {
-			fmt.Printf("%-12s %-7s http=%d\n", r.name, status, r.httpStatus)
+			fmt.Printf("%-12s %-7s http=%-6d trace=%s\n", r.name, status, r.httpStatus, r.traceID)
 		} else {
-			fmt.Printf("%-12s %-7s http=(none)\n", r.name, status)
+			fmt.Printf("%-12s %-7s http=(none) trace=%s\n", r.name, status, r.traceID)
 		}
 	}
 

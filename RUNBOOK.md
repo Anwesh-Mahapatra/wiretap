@@ -1,39 +1,54 @@
 # RUNBOOK
 
-Bootstrapping this stack is a two-phase process: the BDOT Collector cannot
-register with Bindplane until a Bindplane collector installation exists, and
-that installation only gets created by hand in the Bindplane web UI. So
-Phase 1 brings up everything *except* the collector, and Phase 2 is you,
-in the browser.
+This is the operational guide: how to start the stack, how to tell it's
+actually working, and what to do when it isn't. If something's broken and
+you're not sure where to start, start with the next section.
 
-## Phase 1 -- infrastructure
+## If something's wrong, run this first
 
-### 1. Configure `.env`
+```bash
+go run ./cmd/wiretapd check
+```
+
+This prints a pass/fail table for the four things most likely to be broken:
+can it reach Langfuse (the service that records what the AI said), can it
+reach Elasticsearch (the search engine everything ends up in), does the
+Elasticsearch index template exist yet (see step 5 below), and is the
+shared data file actually there and non-empty. Every troubleshooting
+section below corresponds to one row of this table failing.
+
+## 1. Configure `.env`
 
 ```bash
 cp .env.example .env
 ```
 
 Fill in every value in `.env` (see the group comments in `.env.example` for
-what each one is for). In particular:
+what each one is for), including `KIBANA_ENCRYPTION_KEY`, generated with
+`openssl rand -hex 32` (or similar).
 
-- Obtain a free Bindplane license key from https://bindplane.com/download
-  and set `BINDPLANE_LICENSE`.
-- Generate `BINDPLANE_SESSION_SECRET` and `KIBANA_ENCRYPTION_KEY` with
-  `openssl rand -hex 32` (or similar).
-- Leave `OPAMP_SECRET_KEY` blank for now -- it doesn't exist until Phase 2.
-
-### 2. Bring up everything except the collector
+## 2. Bring the stack up
 
 ```bash
-docker compose up -d bindplane transform bindplane-prometheus elasticsearch kibana_settings kibana litellm db prometheus langfuse-web langfuse-worker clickhouse minio redis postgres tracepump-init tracepump
+docker compose up -d
 ```
 
-`bdot-collector` is deliberately omitted: it depends on `bindplane`, and
-without an `OPAMP_SECRET_KEY` yet, it would just start and immediately fail
-to authenticate, over and over. That's expected and is what Phase 2 fixes.
+This starts everything at once; Docker Compose figures out the order on
+its own from each service's declared dependencies. Roughly:
 
-### 3. Verify each service is healthy
+```mermaid
+flowchart TB
+    DB1["postgres, redis,<br/>minio, clickhouse"] --> LF["langfuse-web<br/>langfuse-worker"]
+    DB2["db (LiteLLM's own<br/>Postgres)"] --> LL["litellm"]
+    LF --> LL
+    LF --> TP["tracepump"]
+    ES["elasticsearch"] --> KS["kibana_settings<br/>(one-shot)"]
+    KS --> KB["kibana"]
+    LF --> WD["wiretapd"]
+    ES --> WD
+```
+
+## 3. Verify each service is healthy
 
 ```bash
 docker compose ps
@@ -52,14 +67,13 @@ Expected `STATUS` column:
 | `minio` | `Up (healthy)` |
 | `redis` | `Up (healthy)` |
 | `postgres` | `Up (healthy)` |
-| `transform` | `Up` (no healthcheck defined) -- required for `bindplane` to start at all; see the comment on the `transform` service in `docker-compose.yml` |
-| `bindplane-prometheus` | `Up` (no healthcheck defined) -- required for the Overview and Agents pages to render at all, not just for throughput graphs; see the comment on `BINDPLANE_PROMETHEUS_ENABLE` in `docker-compose.yml` |
-| `bindplane` | `Up (healthy)` -- works even with `BINDPLANE_LICENSE` left blank; a garbage (non-empty but invalid) value will crash it instead |
 | `elasticsearch` | `Up (healthy)` |
 | `kibana_settings` | `Exited (0)` -- this is a one-shot bootstrap job, not a long-running service |
 | `kibana` | `Up (healthy)` |
 | `tracepump-init` | `Exited (0)` -- one-shot; fixes `tracepump_data` volume ownership before `tracepump` starts |
 | `tracepump` | `Up` (no healthcheck; see below) |
+| `wiretapd-init` | `Exited (0)` -- one-shot; same fix, for `wiretapd_state` |
+| `wiretapd` | `Up` (no healthcheck; see below) |
 
 For any service reporting `unhealthy`, get details with:
 
@@ -67,101 +81,52 @@ For any service reporting `unhealthy`, get details with:
 docker inspect --format='{{json .State.Health}}' <container-name> | python3 -m json.tool
 ```
 
-`tracepump` has no Docker healthcheck (it's a poller, not an HTTP service).
-Confirm it's actually working by tailing its logs:
+`tracepump` and `wiretapd` have no Docker healthcheck -- they're background
+pollers, not HTTP services with a port to probe. Confirm they're actually
+working by tailing their logs:
 
 ```bash
 docker compose logs -f tracepump
+docker compose logs -f wiretapd
 ```
 
-You should see periodic `tracepump: poll ok, emitted N new trace(s)` lines
-(every `TRACEPUMP_INTERVAL`, default 30s). Errors are logged as
-`tracepump: poll failed: ... (retrying in ...)`.
+`tracepump` prints periodic `tracepump: poll ok, emitted N new trace(s)`
+lines (every `TRACEPUMP_INTERVAL`, default 30s). `wiretapd` prints
+structured JSON lines including `"msg":"index pass ok"` with counts of how
+many records it read, parsed, and queued for Elasticsearch (every 10s by
+default). Errors from either are logged, not silent.
 
-## Phase 2 -- operator UI work
+## 4. Bootstrap the Elasticsearch index
 
-### 4. Log into Bindplane
-
-Open http://localhost:3001 and log in with `BINDPLANE_USERNAME` /
-`BINDPLANE_PASSWORD` from your `.env`.
-
-### 5. Create a collector installation
-
-On the **Agents** page, select **Install Agent** and choose the **Linux**
-platform. Bindplane will show you a secret key and an OpAMP endpoint. Copy
-the secret key into `.env` as `OPAMP_SECRET_KEY`.
-
-(The OpAMP endpoint Bindplane shows you will likely reference
-`app.bindplane.com` or similar -- ignore that and keep using
-`ws://bindplane:3001/v1/opamp`, already set in `docker-compose.yml`, since
-this collector talks to your local `bindplane` service, not Bindplane Cloud.)
-
-### 6. Start the collector
+Elasticsearch needs to be told, in advance, the shape of the data it's
+about to receive (which fields exist, and what type each one is) -- this
+is called a **mapping**, and getting it right matters (see `arch.md`'s
+section on the `wildcard` field type for a concrete example of what goes
+wrong if it's skipped). This one-time step creates that mapping:
 
 ```bash
-docker compose up -d bdot-collector
+go run ./cmd/wiretapd bootstrap
 ```
 
-Confirm it appears on Bindplane's **Agents** page as `bdot-collector`. It may
-take a few seconds to show as connected after its first successful OpAMP
-heartbeat.
+Safe to run more than once -- it's a plain overwrite of the same
+definition, not an error, if the index already exists.
 
-### 7. Configure the pipeline (in the Bindplane UI)
-
-The following is your work, not something this repo does for you -- the
-constraint behind every task in this project was that Go code and compose
-files only ever emit or carry *raw* data. Everything below is you shaping it
-in the UI:
-
-#### Create the LiteLLM source (OTLP receiver)
-
-#### Create the Langfuse source (File receiver on `/data/langfuse-traces.ndjson`)
-
-#### Add processors for ECS field mapping
-
-#### Add the Elasticsearch destination
-
-#### Roll out the configuration to the BDOT Collector
-
----
-
-## Reference: LiteLLM container stdout as an alternative log source
-
-LiteLLM's OTLP push (`OTEL_EXPORTER_OTLP_ENDPOINT` in `docker-compose.yml`)
-sends **spans**. If you instead want LiteLLM's raw structured JSON stdout as
-a **log** source in step 7 above, it's available via Docker's own JSON log
-file rather than directly from the container.
-
-The `litellm` service uses the `json-file` logging driver (`max-size: 10m`,
-`max-file: 5`), so Docker persists its stdout on the host at:
-
-```
-/var/lib/docker/containers/<container-id>/<container-id>-json.log
-```
-
-Find the exact path for the running container:
+## 5. Generate some test data and confirm it flows through
 
 ```bash
-container_id=$(docker compose ps -q litellm)
-echo "/var/lib/docker/containers/${container_id}/${container_id}-json.log"
+go run ./cmd/wiretap
+go run ./cmd/wiretapd check
 ```
 
-Each line in that file is a JSON object wrapping the container's stdout line
-in Docker's own envelope (`{"log": "...", "stream": "stdout", "time": "..."}`),
-not LiteLLM's JSON directly -- a File source and any processors need to
-account for that extra layer.
+`wiretapd check`'s fourth row should now show the archive as non-empty. Give
+it another 30-60 seconds (one `tracepump` poll cycle plus one `wiretapd`
+index cycle) and query Elasticsearch directly to confirm documents actually
+arrived:
 
-To let `bdot-collector` read this file, the host's Docker log directory must
-be mounted into it. That mount is present in `docker-compose.yml` on the
-`bdot-collector` service, **commented out by default**:
-
-```yaml
-# - /var/lib/docker/containers:/var/lib/docker/containers:ro
+```bash
+source .env
+curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_count
 ```
-
-Uncommenting it grants the collector read access to **every** container's
-logs on this host, not just LiteLLM's. Only enable it if that's acceptable
-for your environment.
 
 ## Port reference
 
@@ -170,12 +135,8 @@ Every host port this compose file claims, all bound to `127.0.0.1` only:
 | Port | Service | Purpose |
 |---|---|---|
 | 3000 | `langfuse-web` | Langfuse UI / API |
-| 3001 | `bindplane` | Web UI + OpAMP endpoint |
-| 3002 | `bindplane` | Listed in Bindplane's docs' port requirements; unused by this single-node bbolt setup |
 | 3030 | `langfuse-worker` | Langfuse background worker |
 | 4000 | `litellm` | LiteLLM proxy (chat completions API) |
-| 4317 | `bdot-collector` | OTLP gRPC receiver |
-| 4318 | `bdot-collector` | OTLP HTTP receiver (LiteLLM's `OTEL_EXPORTER_OTLP_ENDPOINT` points here) |
 | 5432 | `postgres` | Langfuse's Postgres |
 | 5433 | `db` | LiteLLM's own Postgres (remapped from 5432, which Langfuse's Postgres holds) |
 | 5601 | `kibana` | Kibana UI |
@@ -186,111 +147,46 @@ Every host port this compose file claims, all bound to `127.0.0.1` only:
 | 9091 | `minio` | MinIO console |
 | 9092 | `prometheus` | Prometheus UI (remapped from 9090, which MinIO holds) |
 | 9200 | `elasticsearch` | Elasticsearch HTTP API |
-| 13133 | `bdot-collector` | Health check extension |
 
-`tracepump` publishes no host port.
+`tracepump` and `wiretapd` publish no host port.
 
 ## Troubleshooting
 
-### Bindplane UI shows "Oops! Something went wrong", or "Failed to load destinations traces summary data"
+### `wiretapd check` reports "langfuse reachable: FAIL"
 
-This happens on every page (Overview, Agents, even after logout) if
-`bindplane-prometheus` isn't running. Despite what Bindplane's own docs
-imply, `BINDPLANE_PROMETHEUS_ENABLE=false` does not just leave throughput
-graphs empty -- confirmed by querying the Overview/Agents GraphQL queries
-directly, the real underlying error is:
+Symptoms: a connection-refused or timeout error, or a 401.
 
-```
-dial tcp [::1]:9090: connect: connection refused
-```
-
-i.e. Bindplane unconditionally tries to reach Prometheus for these pages'
-summary widgets. `docker-compose.yml` now runs `bindplane-prometheus` and
-sets `BINDPLANE_PROMETHEUS_ENABLE=true` for exactly this reason -- if you see
-this error, check `docker compose ps bindplane-prometheus` first.
-
-You can confirm this diagnosis directly against the API without touching the
-browser at all:
-
-```bash
-curl -s -u "admin:$BINDPLANE_PASSWORD" -X POST http://localhost:3001/v1/graphql \
-  -H "Content-Type: application/json" \
-  -d '{"query":"{ destinationsSummary(period: \"1h\", interval: \"1m\", telemetryType: \"logs\", filterGateways: false) { destinationName } }"}'
-```
-
-An empty `{"data":{"destinationsSummary":[]}}` means it's working; a
-`connection refused` error in the response means `bindplane-prometheus` is
-down or unreachable.
-
-### `bdot-collector` can't reach OpAMP
-
-Symptoms: the container restart-loops; `docker compose logs bdot-collector`
-shows connection refused/timeout or auth failures against
-`ws://bindplane:3001/v1/opamp`.
-
-- If `OPAMP_SECRET_KEY` is blank in `.env`, this is expected -- see Phase 2,
-  steps 5-6.
-- Confirm `bindplane` itself is healthy first (`docker compose ps`); the
-  collector can't do anything useful until it is.
-- Confirm the secret key in `.env` matches the one currently shown for this
-  collector installation on Bindplane's Agents page -- it's invalidated if
-  you delete and recreate the installation.
-- Check connectivity directly from inside the collector container (it has
-  no `curl`/`wget`, but does have `python3`):
-  ```bash
-  docker compose exec bdot-collector python3 -c "import urllib.request; print(urllib.request.urlopen('http://bindplane:3001').status)"
-  ```
-  A connection failure here means it's a networking/service-health problem,
-  not a bad secret key.
-
-### `tracepump` gets 401 from Langfuse
-
-Symptoms: `docker compose logs tracepump` shows
-`langfuse API returned status 401 Unauthorized`.
-
-- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` in `.env` must belong to an
-  actual Langfuse project (create one via the Langfuse UI at
-  http://localhost:3000 if you haven't, or via the
-  `LANGFUSE_INIT_PROJECT_*` bootstrap variables).
-- If you're relying on `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/`SECRET_KEY` to
-  seed the project on first boot, remember those only take effect on
-  Langfuse's *first ever* startup against an empty Postgres database --
-  changing them after the fact does nothing. Set
-  `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` to match whatever project
-  actually exists.
-- Confirm the keys work at all with a direct request:
+- **Connection refused / timeout:** `langfuse-web` isn't up yet or isn't
+  healthy. Check `docker compose ps langfuse-web` and its logs first.
+- **401 Unauthorized:** `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` in
+  `.env` don't belong to an actual Langfuse project. Create one via the
+  Langfuse UI at http://localhost:3000 if you haven't, or via the
+  `LANGFUSE_INIT_PROJECT_*` bootstrap variables. If you're relying on
+  `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/`SECRET_KEY` to seed the project on
+  first boot, remember those only take effect on Langfuse's *first ever*
+  startup against an empty Postgres database -- changing them after the
+  fact does nothing. Confirm directly:
   ```bash
   curl -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" http://localhost:3000/api/public/traces?limit=1
   ```
 
-### `bdot-collector` can't reach Elasticsearch
+### `wiretapd check` reports "elasticsearch reachable: FAIL"
 
-This only becomes relevant once you've configured the Elasticsearch
-destination in Phase 2, step 7.
-
-- Elasticsearch has security enabled; the destination in the Bindplane UI
-  needs real credentials (the `elastic` user and `ELASTIC_PASSWORD` from
-  `.env`, or a dedicated API key you create for this purpose).
-- Confirm Elasticsearch itself is healthy and reachable from inside the
-  collector container (again via `python3`, replacing `PASSWORD_HERE` with
-  your real `ELASTIC_PASSWORD`):
-  ```bash
-  docker compose exec bdot-collector python3 -c "
-  import urllib.request, base64
-  req = urllib.request.Request('http://elasticsearch:9200')
-  req.add_header('Authorization', 'Basic ' + base64.b64encode(b'elastic:PASSWORD_HERE').decode())
-  print(urllib.request.urlopen(req).status)
-  "
-  ```
-- If that fails with a connection error rather than an auth error, check
-  `docker compose ps elasticsearch` and `docker compose logs elasticsearch`
-  first -- a still-starting or unhealthy Elasticsearch is the more common
-  cause than a Bindplane misconfiguration.
+- **Connection refused:** `elasticsearch` isn't up yet or isn't healthy --
+  check `docker compose ps elasticsearch` and its logs.
+- **401 Unauthorized:** `ELASTIC_PASSWORD` in `.env` doesn't match what
+  Elasticsearch actually has. See "Elasticsearch stuck `unhealthy`" below
+  -- the same root cause (a password baked in at first boot) applies here
+  even once the container reports healthy.
+- **Running `wiretapd` from the host, not as a container:** double-check
+  you haven't accidentally set `ELASTICSEARCH_URL` to the in-container
+  hostname (`http://elasticsearch:9200`) -- that only resolves *inside*
+  Docker's network. From the host, it's `http://localhost:9200`.
 
 ### Elasticsearch stuck `unhealthy` after running `docker compose up -d` with `ELASTIC_PASSWORD` blank
 
 This happens if you brought the stack up before filling in `.env` (skipping
-Phase 1, step 1). Elasticsearch only applies `ELASTIC_PASSWORD` when it first
+step 1 above). Elasticsearch only applies `ELASTIC_PASSWORD` when it first
 bootstraps its security realm on that volume -- **filling in `.env` after the
 fact does not retroactively change it**, because the `elastic` user's
 password is already fixed in `elasticsearch_data`. Recreating the container
@@ -311,6 +207,155 @@ alone won't help either. Two ways out:
   ```
   With `ELASTIC_PASSWORD` already correct in `.env` at this point, it bootstraps clean.
 
+### `wiretapd` logs show bulk partial failures, or a growing `dead-letter.json`
+
+Elasticsearch's bulk-index API is unusual: a request can come back with a
+normal-looking success status even when some of the documents inside it
+failed. `wiretapd` always checks each document's individual result, not
+just the overall response -- so if you see this, it's real, not a
+false alarm.
+
+- **The failure was retryable** (Elasticsearch was briefly overloaded or
+  rate-limiting): `wiretapd` retries these automatically with backoff --
+  you'll see a `"retried"` count go up in its periodic counters log, and
+  usually nothing further to do.
+- **The failure was permanent** (a document's shape didn't match the
+  index's mapping): it lands in `dead-letter.json` (inside the
+  `wiretapd_state` volume) with the full Elasticsearch error attached, and
+  is *not* retried in a loop. Inspect it:
+  ```bash
+  docker run --rm -v wiretap_wiretapd_state:/state alpine \
+    cat /state/dead-letter.json
+  ```
+  Each line is one failed document plus the reason. A mapping error here
+  usually means `internal/ecs`'s output shape and `internal/esink`'s index
+  mapping have drifted apart -- check `internal/esink/bootstrap.go`'s
+  `indexMapping()` against whatever field the error names.
+
+### Kibana / a query returns zero results, but you expected data
+
+Work through this in order:
+
+1. **Is there actually anything to find?**
+   ```bash
+   source .env
+   curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_count
+   ```
+   If this is `0`, the problem is upstream of Elasticsearch entirely --
+   check `wiretapd check`'s "archive readable and non-empty" row, and that
+   `go run ./cmd/wiretap` has actually been run recently.
+2. **Does the index exist at all?** If the count query itself 404s, you
+   skipped step 4 (bootstrap) above.
+3. **Is your query using the right field name and type?** A `wildcard`
+   query against a `keyword` or `text` field (or vice versa) can silently
+   return nothing instead of erroring -- see `arch.md`'s section on the
+   `wildcard` decision, and confirm the field's actual mapped type:
+   ```bash
+   curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_mapping | python3 -m json.tool
+   ```
+
+### Documents are present in Elasticsearch, but a field you expect is missing or empty
+
+This is very likely correct, not a bug -- see `internal/parse`'s package
+doc comment for the specific list of fields (`gen_ai.request.model`,
+`MaxTokens`, `Temperature`, `FinishReasons`, `ResponseID`, among others)
+that this project's actual Langfuse data has never reliably carried, and
+which are deliberately left out of the document rather than filled with a
+fabricated zero or empty string. `gen_ai.response.model` and
+`gen_ai.usage.*` specifically are only present when Langfuse returned full
+observation detail for that trace, not just an ID reference -- see
+`internal/parse`'s `decodeObservations` doc comment. A missing field here
+is the pipeline correctly saying "I don't know," which is a different
+(and much safer) thing than silently guessing.
+
+If a field you'd expect to *always* be present (like `trace.id` or
+`llm.output`) is missing, that's a real bug -- check `wiretapd`'s logs
+around the time that document was indexed for a `"skipping unparsable
+archive line"` message, which would explain it.
+
+## Resetting poisoned trace data
+
+Before `cmd/wiretap` set an explicit `metadata.trace_id` per request,
+LiteLLM's Langfuse callback fell back to deriving the trace ID from
+`session_id`. Since `session_id` is intentionally shared across a whole
+run (and across reruns), every scenario collapsed into one Langfuse trace:
+input from one request paired with output from another, tags accumulated
+from every outcome, and latency spanning days instead of one request. See
+`notes.md` for the full failure mode and why `trace_id` must be unique
+while `session_id` must not be.
+
+That historical data is unusable and must be purged -- not silently patched
+around -- so no ECS mapping or detection rule ever gets built against it.
+**This is destructive and is not automated.** Run each step deliberately.
+
+You can confirm which traces are affected first, without deleting anything,
+using `cmd/tracescope`'s merged-trace warnings (added alongside the
+`trace_id` fix): fetch a suspect trace ID and see if it prints a `WARNING:`
+line for `id` equalling `sessionId`, or for carrying more than one of
+`benign`/`injection`/`truncated` in its tags.
+
+### 1. Stop the services that read or write the affected file
+
+```bash
+docker compose stop tracepump wiretapd
+```
+
+`tracepump` so nothing is mid-write when the file is removed; `wiretapd` so
+it doesn't try to read a file that's about to disappear out from under it.
+
+### 2. Delete the NDJSON archive and both its checkpoints
+
+The archive and `tracepump`'s own checkpoint live in the `tracepump_data`
+volume; `wiretapd`'s separate indexer checkpoint lives in `wiretapd_state`
+(see `arch.md`'s "why a plain file sits in the middle" section for why
+there are two checkpoints, not one). Neither `tracepump` nor `wiretapd` is
+a shell-having image, so use a throwaway container against each volume
+directly:
+
+```bash
+docker run --rm -v wiretap_tracepump_data:/data alpine \
+  rm -f /data/langfuse-traces.ndjson /data/tracepump-state.json
+
+docker run --rm -v wiretap_wiretapd_state:/state alpine \
+  rm -f /state/wiretapd-index-state.json /state/wiretapd-fetch-state.json
+```
+
+Deleting the checkpoints (rather than editing them) is the required step,
+not optional cleanup: both `tracepump` and `wiretapd` treat a missing
+checkpoint as "nothing seen/shipped yet" and start over from the beginning.
+If you delete the archive but leave either checkpoint in place, that
+component will believe everything (poisoned data included) was already
+handled, and will silently do nothing with the fresh file.
+
+### 3. Bring both services back up
+
+```bash
+docker compose up -d tracepump wiretapd
+```
+
+`tracepump` does a full resync from Langfuse and repopulates the archive
+from scratch; `wiretapd` then re-reads that archive from its own beginning
+and re-indexes everything into Elasticsearch. Because `wiretapd` uses each
+trace's own ID as the Elasticsearch document ID (see `arch.md`), this
+re-indexing safely overwrites anything already there rather than
+duplicating it.
+
+### 4. The underlying Langfuse traces themselves
+
+Deleting the archive and both checkpoints does not delete anything from
+Langfuse -- the poisoned traces still exist in ClickHouse. You have two
+options, and both are valid depending on what you're trying to preserve:
+
+- **Delete them from the Langfuse UI** (http://localhost:3000). This is the
+  only way to actually remove them from Langfuse itself.
+- **Leave them in place.** Neither `tracepump` nor `wiretapd` can
+  distinguish a poisoned trace from a good one -- they faithfully re-pull
+  and re-index everything, poisoned traces included, on the full resync
+  triggered by step 3. If you choose this, you must filter them out
+  yourself (by trace ID, or by timestamp if you know the affected window)
+  when building detection rules or Kibana data views, since nothing in
+  this pipeline will do it for you.
+
 ## `docker compose down -v` warning
 
 `-v` deletes every named volume, including data that is expensive or
@@ -322,14 +367,13 @@ impossible to regenerate. Before running it, know what you're giving up:
 | `langfuse_clickhouse_data` | **Yes** | All Langfuse trace/observation history |
 | `langfuse_minio_data` | **Yes** | Blob storage backing large trace payloads referenced by the above |
 | `litellm_postgres_data` | **Yes** | LiteLLM's virtual keys, budgets, spend history |
-| `bindplane_data` | **Yes** | Every source/processor/destination you configure by hand in Phase 2 |
-| `bdot_collector_storage` | Usually | Collector's registration state (`manager.yaml`); losing it just means re-registering the collector in Phase 2 |
-| `tracepump_data` | Usually | The NDJSON export and its checkpoint; losing it means tracepump re-emits Langfuse's full trace history on next boot -- harmless, just slower to catch up |
+| `tracepump_data` | Usually | The NDJSON archive and tracepump's checkpoint; losing it means tracepump re-emits Langfuse's full trace history on next boot -- harmless, just slower to catch up |
+| `wiretapd_state` | Usually | wiretapd's own checkpoint(s) and dead-letter file; losing the checkpoint means it re-indexes everything on next boot (harmless -- see the `_id` idempotency note in `arch.md`), but you lose the dead-letter history |
 | `langfuse_clickhouse_logs` | No | ClickHouse's own operational logs |
 | `langfuse_redis_data` | No | Langfuse's queue/cache, fully disposable |
 | `prometheus_data` | No | LiteLLM's Prometheus metrics history, regenerates from new traffic |
-| `elasticsearch_data` | Depends | Whatever you've indexed into Elasticsearch via the Bindplane pipeline -- keep if you've built detection rules or dashboards against it |
-| `kibana_data` | Depends | Kibana's saved objects (data views, dashboards, detection rules) you build in step 7 -- keep if you've done that work |
+| `elasticsearch_data` | Depends | Whatever `wiretapd` has indexed -- keep if you've built detection rules or dashboards against it |
+| `kibana_data` | Depends | Kibana's saved objects (data views, dashboards, detection rules) -- keep if you've done that work |
 
 If in doubt, use `docker compose down` (no `-v`) instead -- it stops and
 removes containers but leaves every volume intact.
