@@ -41,10 +41,9 @@ flowchart TB
     DB1["postgres, redis,<br/>minio, clickhouse"] --> LF["langfuse-web<br/>langfuse-worker"]
     DB2["db (LiteLLM's own<br/>Postgres)"] --> LL["litellm"]
     LF --> LL
-    LF --> TP["tracepump"]
     ES["elasticsearch"] --> KS["kibana_settings<br/>(one-shot)"]
     KS --> KB["kibana"]
-    LF --> WD["wiretapd"]
+    LF --> WD["wiretapd<br/>(fetch + enrich + index)"]
     ES --> WD
 ```
 
@@ -70,9 +69,7 @@ Expected `STATUS` column:
 | `elasticsearch` | `Up (healthy)` |
 | `kibana_settings` | `Exited (0)` -- this is a one-shot bootstrap job, not a long-running service |
 | `kibana` | `Up (healthy)` |
-| `tracepump-init` | `Exited (0)` -- one-shot; fixes `tracepump_data` volume ownership before `tracepump` starts |
-| `tracepump` | `Up` (no healthcheck; see below) |
-| `wiretapd-init` | `Exited (0)` -- one-shot; same fix, for `wiretapd_state` |
+| `wiretapd-init` | `Exited (0)` -- one-shot; fixes ownership of both the `tracepump_data` (archive) and `wiretapd_state` volumes before `wiretapd` starts |
 | `wiretapd` | `Up` (no healthcheck; see below) |
 
 For any service reporting `unhealthy`, get details with:
@@ -81,20 +78,23 @@ For any service reporting `unhealthy`, get details with:
 docker inspect --format='{{json .State.Health}}' <container-name> | python3 -m json.tool
 ```
 
-`tracepump` and `wiretapd` have no Docker healthcheck -- they're background
-pollers, not HTTP services with a port to probe. Confirm they're actually
-working by tailing their logs:
+`wiretapd` has no Docker healthcheck -- it's a background poller, not an
+HTTP service with a port to probe. Confirm it's actually working by
+tailing its logs:
 
 ```bash
-docker compose logs -f tracepump
 docker compose logs -f wiretapd
 ```
 
-`tracepump` prints periodic `tracepump: poll ok, emitted N new trace(s)`
-lines (every `TRACEPUMP_INTERVAL`, default 30s). `wiretapd` prints
-structured JSON lines including `"msg":"index pass ok"` with counts of how
-many records it read, parsed, and queued for Elasticsearch (every 10s by
-default). Errors from either are logged, not silent.
+`wiretapd` prints structured JSON lines on two independent cycles: a fetch
+cycle (every 30s by default) logging `"msg":"fetch poll ok"` with `emitted`
+and `skipped` counts, immediately followed by `"msg":"enrichment counters"`
+with `attempted`/`succeeded`/`skipped`/`failed` counts for that poll's
+per-trace detail fetches (see "Enrichment failures" below for what a
+non-zero `skipped` or `failed` here means); and an index cycle (every 10s
+by default) logging `"msg":"index pass ok"` with counts of how many
+archive lines it read, parsed, and queued for Elasticsearch. Errors from
+either cycle are logged, not silent.
 
 ## 4. Bootstrap the Elasticsearch index
 
@@ -119,14 +119,79 @@ go run ./cmd/wiretapd check
 ```
 
 `wiretapd check`'s fourth row should now show the archive as non-empty. Give
-it another 30-60 seconds (one `tracepump` poll cycle plus one `wiretapd`
-index cycle) and query Elasticsearch directly to confirm documents actually
-arrived:
+it another 30-60 seconds (one `wiretapd` fetch cycle plus one index cycle)
+and query Elasticsearch directly to confirm documents actually arrived:
 
 ```bash
 source .env
 curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_count
 ```
+
+## Updating field mappings after a code change
+
+Elasticsearch needs to be told the shape of the data it's about to receive
+*before* that data arrives (see step 4 above) -- this is called a
+**mapping**. Whenever `internal/esink`'s mapping code changes (a new field,
+or a field's type changes), **that change does not apply retroactively to
+an index that already exists.** `wiretapd bootstrap` updates the
+*template* Elasticsearch will use for the *next* index it creates, but the
+current index -- already created, from the old template -- keeps its old
+mapping regardless of how many times you re-run `bootstrap`. Running
+`bootstrap` again and assuming the mapping is now fixed is the single most
+common way to conclude this pipeline is broken when it isn't.
+
+There are two ways out. For this lab, the first is almost always the right
+one -- it's exactly why the NDJSON archive exists (see `arch.md`):
+
+### Recreate the index and replay the archive (recommended)
+
+```bash
+source .env
+
+# 1. Delete the old, wrongly-mapped concrete index. (The alias
+#    wiretap-llm-events briefly points at nothing -- fine for a lab; don't
+#    do this against something else actively querying it at the same time.)
+curl -s -u "elastic:$ELASTIC_PASSWORD" -X DELETE http://localhost:9200/wiretap-llm-events-000001
+
+# 2. Recreate it from the (already-updated) template. Bootstrap skips
+#    creating the index if one already exists -- step 1 is what makes this
+#    actually create a fresh one instead of silently doing nothing.
+go run ./cmd/wiretapd bootstrap   # or: docker compose run --rm wiretapd bootstrap
+
+# 3. Replay the entire archive through the corrected mapping. This is not
+#    a re-fetch from Langfuse -- the archive already has everything;
+#    backfill just re-reads and re-indexes it. Safe to run any time,
+#    because indexing is _id-keyed (see arch.md): nothing is duplicated.
+go run ./cmd/wiretapd backfill   # or: docker compose run --rm wiretapd backfill
+```
+
+Confirm the new mapping actually took effect:
+
+```bash
+curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_mapping | python3 -m json.tool
+```
+
+### Add just the new field to the existing index (advanced, narrower)
+
+If recreating the index isn't an option (you have data in it that isn't
+in the archive and can't be regenerated), Elasticsearch does allow adding
+a **brand-new** field to an existing index's mapping without recreating
+it -- but only if no document has been indexed with that field yet. If
+even one document already reached the index with the field left to
+dynamic mapping (Elasticsearch guesses a type itself, e.g. `long` instead
+of the `integer` this project's mapping intends), trying to correct it
+afterward fails with a mapper conflict, and recreating the index becomes
+the only way out anyway. Add the field explicitly, before any document
+carrying it is indexed:
+
+```bash
+curl -s -u "elastic:$ELASTIC_PASSWORD" -X PUT http://localhost:9200/wiretap-llm-events/_mapping \
+  -H "Content-Type: application/json" \
+  -d '{"properties": {"llm": {"properties": {"generation_count": {"type": "integer"}}}}}'
+```
+
+This does not work for a field whose *type* changed -- only for a field
+that's genuinely new to the index.
 
 ## Port reference
 
@@ -148,7 +213,7 @@ Every host port this compose file claims, all bound to `127.0.0.1` only:
 | 9092 | `prometheus` | Prometheus UI (remapped from 9090, which MinIO holds) |
 | 9200 | `elasticsearch` | Elasticsearch HTTP API |
 
-`tracepump` and `wiretapd` publish no host port.
+`wiretapd` publishes no host port.
 
 ## Troubleshooting
 
@@ -256,22 +321,88 @@ Work through this in order:
 
 ### Documents are present in Elasticsearch, but a field you expect is missing or empty
 
-This is very likely correct, not a bug -- see `internal/parse`'s package
-doc comment for the specific list of fields (`gen_ai.request.model`,
-`MaxTokens`, `Temperature`, `FinishReasons`, `ResponseID`, among others)
-that this project's actual Langfuse data has never reliably carried, and
-which are deliberately left out of the document rather than filled with a
-fabricated zero or empty string. `gen_ai.response.model` and
-`gen_ai.usage.*` specifically are only present when Langfuse returned full
-observation detail for that trace, not just an ID reference -- see
-`internal/parse`'s `decodeObservations` doc comment. A missing field here
-is the pipeline correctly saying "I don't know," which is a different
-(and much safer) thing than silently guessing.
+Most of the time this is correct, not a bug. Two different categories:
+
+- **`gen_ai.response.finish_reasons` (or anything like it) -- not just
+  missing on this document, missing on *every* document, permanently.**
+  This one field is genuinely unavailable from this project's Langfuse
+  data (Langfuse's observation objects don't carry it under any endpoint
+  this project has found) and was removed from `internal/ecs`'s mapper
+  entirely rather than left to always emit empty -- see
+  `internal/ecs/genai.go`'s package doc and `notes.md` for the full
+  reasoning. If you're looking for it in a query or a dashboard, stop --
+  it was never going to be there, on any document, ever.
+- **`gen_ai.usage.input_tokens`/`output_tokens`, `gen_ai.request.model`,
+  `gen_ai.request.max_tokens`, `gen_ai.response.model`,
+  `gen_ai.response.id` -- present on some documents, absent on others.**
+  These come from Langfuse's *trace detail* endpoint, fetched via this
+  project's enrichment step (see `arch.md`'s "Two Langfuse endpoints, one
+  archive" section) -- not the list endpoint every trace gets from just
+  being polled. A document missing these specific fields either had
+  enrichment fail for that one trace (see "Enrichment failures" below --
+  check `wiretapd`'s logs around when it was indexed) or was indexed with
+  `--no-enrich` set. Either way, this is the pipeline correctly saying "I
+  don't have this," not a fabricated zero or empty string standing in for
+  it -- see `TestMap_NoGenAIFieldEmittedAsZeroSubstituteForMissing` in
+  `internal/ecs`.
 
 If a field you'd expect to *always* be present (like `trace.id` or
 `llm.output`) is missing, that's a real bug -- check `wiretapd`'s logs
 around the time that document was indexed for a `"skipping unparsable
 archive line"` message, which would explain it.
+
+### Enrichment failures (`gen_ai.*` fields missing on specific new documents)
+
+Every fetch poll logs an `"enrichment counters"` line right after
+`"fetch poll ok"` (see the log-tailing section above) with
+`attempted`/`succeeded`/`skipped`/`failed` counts. `skipped` and `failed`
+mean different things and call for different reactions:
+
+- **`skipped` (expected, self-healing, no action needed):** a per-trace
+  enrichment attempt hit something transient --
+  a 404 (Langfuse's detail endpoint hasn't caught up to a trace that just
+  appeared in the list -- see `internal/pipeline/enrich.go`'s
+  `enrichTrace` doc comment for why this is a real, expected race, not an
+  error), a rate limit, or a network blip. That trace is *not* archived
+  this poll and is *not* marked seen, so it comes back around and is
+  retried automatically on the next poll (every 30s by default) via the
+  same overlap-window mechanism that already covers late-arriving traces.
+  You'll see the corresponding trace ID in a `"pipeline: enrichment for
+  trace ... deferred to next poll"` line on stderr. A skip count that
+  clears to 0 on the very next poll (rather than growing every poll) is
+  this working as designed -- do nothing.
+- **`failed` (real, action needed):** something systemic broke --
+  invalid credentials, a decode error, or an unrecognized HTTP status --
+  and the whole poll aborted rather than silently limping through with
+  one broken trace after another. You'll see a `"pipeline: enrichment for
+  trace ... failed (fatal, aborting poll)"` line, followed by `"fetch poll
+  failed"` with the underlying error and a retry backoff. Treat this the
+  same as any other `"fetch poll failed"` -- check `LANGFUSE_PUBLIC_KEY`/
+  `LANGFUSE_SECRET_KEY` in `.env` first (see "langfuse reachable: FAIL"
+  above), since an auth failure on the detail endpoint is the most common
+  systemic cause.
+- **Rate limiting across a whole page:** if `skipped` is consistently
+  high across many polls in a row (not clearing), the enrichment worker
+  pool is likely being rate-limited faster than it can catch up --
+  `EnrichConcurrency` (default 4, `WIRETAPD_ENRICH_CONCURRENCY` in
+  `.env`) may be too aggressive for your Langfuse instance's own limits.
+  Lowering it trades throughput for fewer 429s; see
+  `internal/pipeline/enrich.go`'s `enrichmentPool` doc comment for how
+  the shared pause across workers already coordinates this, and why it's
+  not a full token-bucket limiter.
+- **A partial page (some traces in a poll enriched, others not):** this
+  is normal, not a bug -- `enrichPage` fetches per-trace detail
+  concurrently and independently, so one trace's 404 race or rate limit
+  never blocks the others on the same page from succeeding. Expect to see
+  mixed `succeeded`/`skipped` counts within a single poll when Langfuse's
+  detail endpoint is still catching up on some but not all of a batch of
+  brand-new traces.
+
+To disable enrichment entirely (accepting that `gen_ai.usage.*` and
+friends stay permanently absent, same as before enrichment existed), pass
+`--no-enrich` to `wiretapd run`. There's rarely a reason to do this in
+this lab -- it exists mainly for cost control against Langfuse instances
+with strict rate limits.
 
 ## Resetting poisoned trace data
 
@@ -294,51 +425,57 @@ using `cmd/tracescope`'s merged-trace warnings (added alongside the
 line for `id` equalling `sessionId`, or for carrying more than one of
 `benign`/`injection`/`truncated` in its tags.
 
-### 1. Stop the services that read or write the affected file
+### 1. Stop the service that reads and writes the affected file
 
 ```bash
-docker compose stop tracepump wiretapd
+docker compose stop wiretapd
 ```
 
-`tracepump` so nothing is mid-write when the file is removed; `wiretapd` so
-it doesn't try to read a file that's about to disappear out from under it.
+So nothing is mid-write when the file is removed, and nothing tries to
+read a file that's about to disappear out from under it. `wiretapd` is
+this stack's only fetcher and only indexer (see `arch.md`'s end-to-end
+sequence) -- there's no second service to stop separately.
 
-### 2. Delete the NDJSON archive and both its checkpoints
+### 2. Delete the NDJSON archive and both checkpoints
 
-The archive and `tracepump`'s own checkpoint live in the `tracepump_data`
-volume; `wiretapd`'s separate indexer checkpoint lives in `wiretapd_state`
-(see `arch.md`'s "why a plain file sits in the middle" section for why
-there are two checkpoints, not one). Neither `tracepump` nor `wiretapd` is
-a shell-having image, so use a throwaway container against each volume
-directly:
+The archive lives in the `tracepump_data` volume (named for this
+project's history -- see that volume's own comment in
+`docker-compose.yml` -- but written by `wiretapd`, not a separate
+`tracepump` service); `wiretapd`'s own fetch and index checkpoints both
+live in the separate `wiretapd_state` volume (see `arch.md`'s "why a
+plain file sits in the middle" section for why fetch and index keep two
+checkpoints, not one). `wiretapd` isn't a shell-having image, so use a
+throwaway container against each volume directly:
 
 ```bash
 docker run --rm -v wiretap_tracepump_data:/data alpine \
-  rm -f /data/langfuse-traces.ndjson /data/tracepump-state.json
+  rm -f /data/langfuse-traces.ndjson
 
 docker run --rm -v wiretap_wiretapd_state:/state alpine \
   rm -f /state/wiretapd-index-state.json /state/wiretapd-fetch-state.json
 ```
 
 Deleting the checkpoints (rather than editing them) is the required step,
-not optional cleanup: both `tracepump` and `wiretapd` treat a missing
-checkpoint as "nothing seen/shipped yet" and start over from the beginning.
-If you delete the archive but leave either checkpoint in place, that
-component will believe everything (poisoned data included) was already
-handled, and will silently do nothing with the fresh file.
+not optional cleanup: `wiretapd` treats a missing checkpoint as "nothing
+seen/shipped yet" and starts over from the beginning, for both its fetch
+and index cycles independently. If you delete the archive but leave
+either checkpoint in place, that cycle will believe everything (poisoned
+data included) was already handled, and will silently do nothing with
+the fresh file.
 
-### 3. Bring both services back up
+### 3. Bring the service back up
 
 ```bash
-docker compose up -d tracepump wiretapd
+docker compose up -d wiretapd
 ```
 
-`tracepump` does a full resync from Langfuse and repopulates the archive
-from scratch; `wiretapd` then re-reads that archive from its own beginning
-and re-indexes everything into Elasticsearch. Because `wiretapd` uses each
-trace's own ID as the Elasticsearch document ID (see `arch.md`), this
-re-indexing safely overwrites anything already there rather than
-duplicating it.
+With no fetch checkpoint, `wiretapd` does a full resync from Langfuse
+(enriching each trace as usual) and repopulates the archive from scratch;
+with no index checkpoint, it then re-reads that archive from its own
+beginning and re-indexes everything into Elasticsearch. Because
+`wiretapd` uses each trace's own ID as the Elasticsearch document ID (see
+`arch.md`), this re-indexing safely overwrites anything already there
+rather than duplicating it.
 
 ### 4. The underlying Langfuse traces themselves
 
@@ -348,11 +485,11 @@ options, and both are valid depending on what you're trying to preserve:
 
 - **Delete them from the Langfuse UI** (http://localhost:3000). This is the
   only way to actually remove them from Langfuse itself.
-- **Leave them in place.** Neither `tracepump` nor `wiretapd` can
-  distinguish a poisoned trace from a good one -- they faithfully re-pull
-  and re-index everything, poisoned traces included, on the full resync
-  triggered by step 3. If you choose this, you must filter them out
-  yourself (by trace ID, or by timestamp if you know the affected window)
+- **Leave them in place.** `wiretapd` can't distinguish a poisoned trace
+  from a good one -- it faithfully re-pulls and re-indexes everything,
+  poisoned traces included, on the full resync triggered by step 3. If
+  you choose this, you must filter them out yourself (by trace ID, or by
+  timestamp if you know the affected window)
   when building detection rules or Kibana data views, since nothing in
   this pipeline will do it for you.
 
@@ -367,8 +504,8 @@ impossible to regenerate. Before running it, know what you're giving up:
 | `langfuse_clickhouse_data` | **Yes** | All Langfuse trace/observation history |
 | `langfuse_minio_data` | **Yes** | Blob storage backing large trace payloads referenced by the above |
 | `litellm_postgres_data` | **Yes** | LiteLLM's virtual keys, budgets, spend history |
-| `tracepump_data` | Usually | The NDJSON archive and tracepump's checkpoint; losing it means tracepump re-emits Langfuse's full trace history on next boot -- harmless, just slower to catch up |
-| `wiretapd_state` | Usually | wiretapd's own checkpoint(s) and dead-letter file; losing the checkpoint means it re-indexes everything on next boot (harmless -- see the `_id` idempotency note in `arch.md`), but you lose the dead-letter history |
+| `tracepump_data` | Usually | The NDJSON archive (named for this project's history; written by `wiretapd`, see that volume's comment in `docker-compose.yml`); losing it means `wiretapd` re-fetches (and re-enriches) Langfuse's full trace history on next boot -- harmless, just slower to catch up |
+| `wiretapd_state` | Usually | `wiretapd`'s own fetch and index checkpoints, plus its dead-letter file; losing a checkpoint means that cycle starts over on next boot (harmless -- see the `_id` idempotency note in `arch.md`), but you lose the dead-letter history |
 | `langfuse_clickhouse_logs` | No | ClickHouse's own operational logs |
 | `langfuse_redis_data` | No | Langfuse's queue/cache, fully disposable |
 | `prometheus_data` | No | LiteLLM's Prometheus metrics history, regenerates from new traffic |

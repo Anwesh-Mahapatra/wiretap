@@ -62,14 +62,15 @@ func Map(ev *model.LLMEvent, cfg Config) *Document {
 			Module:   "wiretap",
 		},
 		LLM: llm{
-			SystemPrompt: lastMessageContent(ev.Messages, "system"),
-			UserPrompt:   lastMessageContent(ev.Messages, "user"),
-			Output:       ev.OutputContent,
-			OutputRole:   ev.OutputRole,
-			Messages:     encodeMessages(ev.Messages),
-			MessageCount: len(ev.Messages),
-			OutputLength: len(ev.OutputContent),
-			TotalCostUSD: ev.TotalCost,
+			SystemPrompt:    lastMessageContent(ev.Messages, "system"),
+			UserPrompt:      lastMessageContent(ev.Messages, "user"),
+			Output:          ev.OutputContent,
+			OutputRole:      ev.OutputRole,
+			Messages:        encodeMessages(ev.Messages),
+			MessageCount:    len(ev.Messages),
+			OutputLength:    len(ev.OutputContent),
+			TotalCostUSD:    ev.TotalCost,
+			GenerationCount: ev.GenerationCount,
 		},
 		Labels: labels{
 			WiretapOutcome:  string(ev.Outcome),
@@ -115,8 +116,8 @@ func buildGenAI(ev *model.LLMEvent, cfg Config) *genAI {
 	if ev.RequestModel != "" || ev.MaxTokens != nil {
 		g.Request = &genAIRequest{Model: ev.RequestModel, MaxTokens: ev.MaxTokens}
 	}
-	if ev.ResponseModel != "" || ev.ResponseID != "" || len(ev.FinishReasons) > 0 {
-		g.Response = &genAIResponse{Model: ev.ResponseModel, ID: ev.ResponseID, FinishReasons: ev.FinishReasons}
+	if ev.ResponseModel != "" || ev.ResponseID != "" {
+		g.Response = &genAIResponse{Model: ev.ResponseModel, ID: ev.ResponseID}
 	}
 	if ev.InputTokens != nil || ev.OutputTokens != nil {
 		g.Usage = &genAIUsage{InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens}

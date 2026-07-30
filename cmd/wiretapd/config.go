@@ -41,6 +41,12 @@ type config struct {
 	fetchStatePath string
 	indexStatePath string
 	indexBase      string
+
+	// enrichConcurrency bounds how many GetTrace calls the fetch stage
+	// runs at once when enrichment is on (see pipeline.FetchConfig.Enrich
+	// and internal/pipeline/enrich.go). 0 means "use the package default"
+	// (4).
+	enrichConcurrency int
 }
 
 func loadConfig() (config, error) {
@@ -70,6 +76,14 @@ func loadConfig() (config, error) {
 			return cfg, fmt.Errorf("parsing ELASTICSEARCH_TLS_SKIP_VERIFY=%q: %w", v, err)
 		}
 		cfg.esTLSSkipVerify = b
+	}
+
+	if v := os.Getenv("WIRETAPD_ENRICH_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("parsing WIRETAPD_ENRICH_CONCURRENCY=%q: %w", v, err)
+		}
+		cfg.enrichConcurrency = n
 	}
 
 	if cfg.langfusePublicKey == "" || cfg.langfuseSecretKey == "" {

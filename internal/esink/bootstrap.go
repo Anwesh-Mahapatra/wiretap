@@ -177,9 +177,16 @@ func indexMapping() map[string]any {
 					},
 					"response": map[string]any{
 						"properties": map[string]any{
-							"model":          keyword,
-							"id":             keyword,
-							"finish_reasons": keyword, // array of keyword values; see indexMapping's doc comment on why not ES's "nested" type
+							"model": keyword,
+							"id":    keyword,
+							// No finish_reasons mapping: internal/ecs's
+							// genAIResponse doesn't have that field.
+							// Confirmed genuinely unavailable from this
+							// project's Langfuse data (see
+							// internal/ecs/genai.go's package doc and
+							// notes.md) -- mapping a field the document
+							// never sends would be dead, misleading
+							// schema.
 						},
 					},
 					"usage": map[string]any{
@@ -200,6 +207,12 @@ func indexMapping() map[string]any {
 					"message_count":  integer,
 					"output_length":  integer,
 					"total_cost_usd": double,
+					// generation_count: how many GENERATION observations
+					// contributed to gen_ai.usage.* above (see
+					// internal/parse's applyGenerations). Small, bounded
+					// counter -- integer, same reasoning as message_count/
+					// output_length above.
+					"generation_count": integer,
 				},
 			},
 			"labels": map[string]any{

@@ -271,6 +271,12 @@ func TestMap_EventIngestedComesFromEventNotClock(t *testing.T) {
 	}
 }
 
+// TestBuildReference tests buildReference's URL construction (joining
+// ev.SourceRef onto cfg.LangfuseBaseURL for event.reference, the
+// click-from-Kibana link back to Langfuse's UI) -- it has nothing to do
+// with gen_ai.* schema validation despite the name-adjacent proximity to
+// this file's other tests. See TestGenAIFieldsExistInReferenceDoc
+// (genai_test.go) for the actual reference-document check.
 func TestBuildReference(t *testing.T) {
 	cases := []struct {
 		name, base, ref, want string

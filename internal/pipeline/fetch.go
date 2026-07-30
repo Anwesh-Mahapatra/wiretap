@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +50,17 @@ type FetchConfig struct {
 	// run start from a specific point in Langfuse's history instead of
 	// its earliest trace.
 	From time.Time
+	// Enrich, when true, fetches full trace detail (GetTraceRaw) for every
+	// new trace and archives that instead of the list-shaped record --
+	// see PollOnce's doc comment and internal/pipeline/enrich.go for why
+	// and how. Off in the zero value, matching cmd/tracepump's default
+	// (a deliberately dumb, cheap, faithful pipe); cmd/wiretapd turns it
+	// on by default itself.
+	Enrich bool
+	// EnrichConcurrency bounds how many GetTrace calls run at once when
+	// Enrich is true. Defaults to 4 (see defaultEnrichConcurrency) if left
+	// at zero.
+	EnrichConcurrency int
 }
 
 // fetchSeenEntry and fetchCheckpointState are the Fetcher's own persisted
@@ -83,17 +95,29 @@ func hasTag(tags []string, tag string) bool {
 	return false
 }
 
-// Fetcher polls Langfuse for traces and appends each one, byte-for-byte,
-// as one line of NDJSON to an archive file. This is the same mechanism
+// Fetcher polls Langfuse for traces and appends each one, byte-for-byte, as
+// one line of NDJSON to an archive file. This is the same mechanism
 // cmd/tracepump has always used (see its package doc) -- extracted here so
 // cmd/wiretapd's own fetch stage is the same code, not a reimplementation
 // of it, when it isn't running with --no-fetch against tracepump's own
 // container instead.
+//
+// When cfg.Enrich is set, "byte-for-byte" still holds -- it just means
+// byte-for-byte faithful to a *different, richer* API response
+// (GetTraceRaw's detail payload instead of ListTraces' list-shaped one),
+// fetched and archived instead of the original, never rewritten after the
+// fact. See internal/pipeline/enrich.go for the concurrency-bounded,
+// per-trace-failure-isolated mechanics.
 type Fetcher struct {
 	client *langfuse.Client
 	cfg    FetchConfig
 	cp     *fetchCheckpointState
 	out    *ndjsonWriter
+
+	enrichAttempted atomic.Int64
+	enrichSucceeded atomic.Int64
+	enrichSkipped   atomic.Int64
+	enrichFailed    atomic.Int64
 }
 
 // NewFetcher opens (creating if necessary) the archive and checkpoint files
@@ -163,6 +187,11 @@ func (f *Fetcher) PollOnce(ctx context.Context) (emitted, skipped int, err error
 			return emitted, skipped, err
 		}
 
+		// First pass: dedup and the health-check filter, both permanent
+		// per-trace decisions that always mark a trace seen regardless of
+		// enrichment. Everything left is a genuine candidate to archive.
+		var candidates []traceCore
+		rawByID := make(map[string]json.RawMessage, len(resp.Data))
 		for _, raw := range resp.Data {
 			var core traceCore
 			if err := json.Unmarshal(raw, &core); err != nil {
@@ -175,19 +204,60 @@ func (f *Fetcher) PollOnce(ctx context.Context) (emitted, skipped int, err error
 
 			if f.cfg.SkipHealthchecks && hasTag(core.Tags, healthCheckTag) {
 				skipped++
-			} else {
-				if err := f.out.WriteLine(raw); err != nil {
-					return emitted, skipped, fmt.Errorf("writing trace %q: %w", core.ID, err)
+				seen[core.ID] = struct{}{}
+				newSeen = append(newSeen, fetchSeenEntry{ID: core.ID, Timestamp: core.Timestamp})
+				if t, perr := time.Parse(time.RFC3339Nano, core.Timestamp); perr == nil && t.After(maxTime) {
+					maxTime = t
+					maxTimestamp = core.Timestamp
 				}
-				emitted++
+				continue
 			}
 
-			seen[core.ID] = struct{}{}
-			newSeen = append(newSeen, fetchSeenEntry{ID: core.ID, Timestamp: core.Timestamp})
+			candidates = append(candidates, core)
+			rawByID[core.ID] = raw
+		}
 
-			if t, perr := time.Parse(time.RFC3339Nano, core.Timestamp); perr == nil && t.After(maxTime) {
+		// Second pass: archive each candidate, enriched if configured.
+		// enrichPage returns one result per candidate, in order, even for
+		// the ones it skips -- see enrichTrace's doc comment for what
+		// "skip" means and why it's not the same as "fail."
+		var results []enrichedResult
+		if f.cfg.Enrich && len(candidates) > 0 {
+			results, err = f.enrichPage(ctx, candidates)
+			if err != nil {
+				// A systemic (non-skip) enrichment failure: nothing from
+				// this page is written and the checkpoint is left exactly
+				// where it was, the same way a ListTraces failure above
+				// already aborts without partial progress.
+				return emitted, skipped, fmt.Errorf("enrichment: %w", err)
+			}
+		} else {
+			results = make([]enrichedResult, len(candidates))
+			for i, core := range candidates {
+				results[i] = enrichedResult{core: core, raw: rawByID[core.ID]}
+			}
+		}
+
+		for _, r := range results {
+			if r.skip {
+				// Deliberately not marked seen and not advancing
+				// maxTime past this ID: the existing overlap-window
+				// mechanism (see overlapWindow above) will naturally
+				// re-offer it on a future poll.
+				continue
+			}
+
+			if err := f.out.WriteLine(r.raw); err != nil {
+				return emitted, skipped, fmt.Errorf("writing trace %q: %w", r.core.ID, err)
+			}
+			emitted++
+
+			seen[r.core.ID] = struct{}{}
+			newSeen = append(newSeen, fetchSeenEntry{ID: r.core.ID, Timestamp: r.core.Timestamp})
+
+			if t, perr := time.Parse(time.RFC3339Nano, r.core.Timestamp); perr == nil && t.After(maxTime) {
 				maxTime = t
-				maxTimestamp = core.Timestamp
+				maxTimestamp = r.core.Timestamp
 			}
 		}
 

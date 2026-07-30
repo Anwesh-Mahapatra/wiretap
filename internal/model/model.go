@@ -84,9 +84,18 @@ type LLMEvent struct {
 	ResponseModel string // model that actually answered -- may differ from RequestModel on fallback/routing
 
 	// Usage
-	InputTokens  *int
-	OutputTokens *int
+	InputTokens  *int // summed across every GENERATION observation, when the source reports detail -- see internal/parse's package doc
+	OutputTokens *int // summed across every GENERATION observation
 	TotalCost    *float64
+	// GenerationCount is how many GENERATION observations contributed to
+	// InputTokens/OutputTokens/ResponseModel/ResponseID. Always a real,
+	// known value (0 when the source gave no observation detail at all,
+	// or genuinely had no GENERATION observations) -- never a pointer,
+	// because "zero generations" is itself meaningful, not "unknown."
+	// Exists so a summed token count is never presented without the
+	// context of how many calls it summarizes -- see internal/ecs's
+	// llm.generation_count.
+	GenerationCount int
 
 	// Classification
 	Outcome       Outcome

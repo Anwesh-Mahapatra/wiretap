@@ -117,6 +117,88 @@ silently answers a different question than the one being asked. Every
 `gen_ai.*` field in this project was checked against the reference doc for
 exactly this reason, not as a formality.
 
+### Failure Mode: The Empty `gen_ai.*` Fields (a schema that validated, tested green, and emitted nothing)
+
+Observed in this project's own history, not hypothetical: seven of the nine
+`gen_ai.*` fields this project maps -- both token counts, the requested and
+answering model names, the max-tokens setting, the response ID, and finish
+reasons -- were permanently empty on every real document, from the first
+commit that introduced `gen_ai.*` mapping up until this was diagnosed and
+fixed. Not empty on some documents. Empty on all of them, silently, the
+entire time.
+
+The proximate cause: Langfuse's public API has two endpoints for reading a
+trace back (see `arch.md`'s "Two Langfuse endpoints, one archive" section
+for the full shape difference), and only one of them -- the list endpoint,
+`GET /api/public/traces` -- was ever called by the fetch stage. The list
+endpoint reduces each observation to a bare ID string. The detail endpoint,
+`GET /api/public/traces/{id}`, returns the same observation as a full
+object with `usage`, `model`, `metadata`, and `modelParameters` attached --
+and every one of those seven fields reads from data that only exists on
+that full object. A `GetTrace` function that called the detail endpoint
+already existed in `internal/langfuse`, fully typed and unit-tested; it was
+just never wired into the fetch stage that actually runs in production.
+`internal/pipeline` only ever called `ListTraces`.
+
+What makes this failure mode distinct from the merged-traces one above:
+that one was silently *wrong* (a plausible-looking value that was actually
+fabricated from unrelated data). This one was silently *absent* -- which
+this project's own stated doctrine treats as the honest, lower-risk
+outcome ("absence is at least legible as missing"). And in one sense that
+doctrine held: nobody was misled by a fake token count, because there was
+never a fake token count, only a missing one. But absence being *honest*
+does not mean absence being *invisible* is acceptable, and here it was
+invisible for a specific, structural reason:
+
+* **The mapper was correct.** `internal/ecs/genai.go` read the right struct
+  fields, under the right names, with the right types, cited against
+  `docs/reference/ecs-gen_ai.md`. There was no bug to find by reading that
+  file.
+* **The tests were green.** `TestMap_NoGenAIFieldEmittedAsZeroSubstituteForMissing`
+  specifically asserts that an absent field stays absent rather than being
+  coerced to a zero value -- and it passed, correctly, on every run,
+  because the fields genuinely were absent given the input the mapper was
+  handed. The test was validating the right property; it just had no way
+  to know the *input itself* was thinner than production data actually is.
+* **The schema validated.** Every document indexed cleanly, matched its
+  mapping, and was queryable. A dashboard built against `gen_ai.usage.*`
+  would show real, legitimate-looking empty results -- not an error, not a
+  missing index, just consistently nothing -- and "consistently nothing"
+  is far more easily misread as "this traffic pattern has no token usage"
+  than as "this pipeline never fetched the field."
+
+The gap was never inside the boundary anyone was actually checking. It was
+one layer upstream, in *what got fetched*, not in what got parsed or
+mapped from what was fetched. This is why Task 1 of the fix that resolved
+this was investigation-only, with an explicit instruction not to touch the
+mapper to compensate: changing `internal/ecs/genai.go` to paper over a
+fetch-layer gap would have made the mapper *wrong* to make the pipeline
+*look* right, which is a strictly worse trade than the honest absence that
+came before it.
+
+```mermaid
+flowchart LR
+    A["fetch stage calls\nGET /api/public/traces (list)"] --> B["observations reduced to\nID strings only"]
+    B --> C["parse: no usage/model data\nto read -- fields absent"]
+    C --> D["mapper: correctly omits\nabsent fields (as designed)"]
+    D --> E["ES: schema valid,\ndocument indexed, query clean"]
+    E --> F["7 of 9 gen_ai.* fields\nempty on every document,\nno error anywhere"]
+```
+
+The fix generalizes past this one incident: **a green test suite proves the
+code does what the test describes, not that the test describes what
+production actually needs.** `TestMap_NoGenAIFieldEmittedAsZeroSubstituteForMissing`
+was never wrong -- it just wasn't sufficient on its own, because nothing in
+this project's test suite exercised the fetch stage against the *shape*
+of data the detail endpoint actually returns until real captured fixtures
+(`internal/langfuse/testdata/detail_truncated.json`,
+`detail_benign.json`) were added specifically to close that gap. When a
+field is unexpectedly, permanently absent across every record, the
+question to ask before assuming "this data genuinely doesn't exist" is
+"did every step between the source system and this field actually run,"
+starting from the network call outward -- not just from the mapper
+inward, which is the direction a bug usually gets looked for first.
+
 ### The canary-in-the-system-prompt trap (why detections must be scoped to output, not input)
 
 Every scenario this project sends carries the same canary string

@@ -27,6 +27,7 @@ func cmdRun(args []string) error {
 	fromStr := fs.String("from", "", "only fetch traces at or after this RFC3339 timestamp (first run only; ignored once a fetch checkpoint exists, and ignored entirely with --no-fetch)")
 	skipHealthchecks := fs.Bool("skip-healthchecks", true, "drop litellm-internal-health-check events before indexing -- wiretapd defaults this true, unlike tracepump, since it has an opinion about what belongs in Elasticsearch")
 	dryRun := fs.Bool("dry-run", false, "map and print documents instead of indexing them -- how a mapping change gets reviewed before it touches the index")
+	noEnrich := fs.Bool("no-enrich", false, "archive the raw list-shaped record instead of fetching full trace detail per new trace. Enrichment is on by default: it's what populates gen_ai.usage.*, gen_ai.request.model, gen_ai.response.model, and gen_ai.request.max_tokens (see internal/pipeline/enrich.go) -- with --no-enrich those fields stay permanently absent, same as before enrichment existed. Costs one extra bounded-concurrency Langfuse API call per new trace; turn it off only if that cost is the problem.")
 	logFormat := fs.String("log-format", "json", "log format: json or text")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -65,10 +66,12 @@ func cmdRun(args []string) error {
 	var fetcher *pipeline.Fetcher
 	if !*noFetch {
 		fetcher, err = pipeline.NewFetcher(cfg.langfuseClient(), pipeline.FetchConfig{
-			OutPath:          cfg.archivePath,
-			StatePath:        cfg.fetchStatePath,
-			SkipHealthchecks: *skipHealthchecks,
-			From:             fromTime,
+			OutPath:           cfg.archivePath,
+			StatePath:         cfg.fetchStatePath,
+			SkipHealthchecks:  *skipHealthchecks,
+			From:              fromTime,
+			Enrich:            !*noEnrich,
+			EnrichConcurrency: cfg.enrichConcurrency,
 		})
 		if err != nil {
 			return err
@@ -135,10 +138,24 @@ func runFetchOnce(ctx context.Context, f *pipeline.Fetcher, logger *slog.Logger)
 		return fmt.Errorf("fetch pass: %w", err)
 	}
 	logger.Info("fetch pass ok", "emitted", emitted, "skipped", skipped)
+	logEnrichCounters(logger, f)
 	if err := f.SaveCheckpoint(); err != nil {
 		return fmt.Errorf("saving fetch checkpoint: %w", err)
 	}
 	return nil
+}
+
+func logEnrichCounters(logger *slog.Logger, f *pipeline.Fetcher) {
+	c := f.EnrichCounters()
+	if c.Attempted == 0 {
+		return // enrichment off, or nothing new to enrich this pass
+	}
+	logger.Info("enrichment counters",
+		"attempted", c.Attempted,
+		"succeeded", c.Succeeded,
+		"skipped", c.Skipped,
+		"failed", c.Failed,
+	)
 }
 
 // runFetchLoop polls on defaultFetchInterval (matching cmd/tracepump's own
@@ -164,6 +181,7 @@ func runFetchLoop(ctx context.Context, f *pipeline.Fetcher, logger *slog.Logger)
 
 		backoff = 1 * time.Second
 		logger.Info("fetch poll ok", "emitted", emitted, "skipped", skipped)
+		logEnrichCounters(logger, f)
 		if err := f.SaveCheckpoint(); err != nil {
 			logger.Error("fetch checkpoint save failed", "error", err)
 		}

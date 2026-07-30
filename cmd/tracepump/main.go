@@ -7,15 +7,18 @@
 // Langfuse's shape into anything else (ECS or otherwise) is internal/ecs's
 // job, run by wiretapd against this archive. Keeping the archive raw means
 // a mapping bug can always be fixed and replayed without re-fetching from
-// Langfuse.
+// Langfuse. That includes --enrich (off by default, see the flag's own
+// description): even enriched, what's archived is still exactly what the
+// Langfuse API returned, byte-for-byte -- just a detail response instead
+// of a list one, never rewritten after the fact.
 //
-// The actual polling/checkpoint/archive-writing mechanics live in
-// internal/pipeline.Fetcher -- this file is just that plus a CLI: flags,
-// env vars, the poll loop's cadence and logging, and signal handling.
-// cmd/wiretapd's own fetch stage (unless run with --no-fetch) uses the
-// exact same Fetcher type, not a reimplementation of it.
+// The actual polling/checkpoint/archive-writing/enrichment mechanics live
+// in internal/pipeline.Fetcher -- this file is just that plus a CLI:
+// flags, env vars, the poll loop's cadence and logging, and signal
+// handling. cmd/wiretapd's own fetch stage (unless run with --no-fetch)
+// uses the exact same Fetcher type, not a reimplementation of it.
 //
-// Usage: go run ./cmd/tracepump [--once]
+// Usage: go run ./cmd/tracepump [--once] [--enrich]
 package main
 
 import (
@@ -46,15 +49,16 @@ const (
 
 func main() {
 	once := flag.Bool("once", false, "perform a single poll pass and exit, instead of polling continuously")
+	enrich := flag.Bool("enrich", false, "fetch full trace detail per new trace and archive that instead of the raw list-shaped record (see internal/pipeline/enrich.go). Off by default -- tracepump is deliberately the dumb, cheap, faithful pipe; wiretapd is where enrichment is on by default. Opt in here only if you're running tracepump standalone without wiretapd's own fetch stage and still want gen_ai.usage.*/request.model/response.model/request.max_tokens populated.")
 	flag.Parse()
 
-	if err := run(*once); err != nil {
+	if err := run(*once, *enrich); err != nil {
 		fmt.Fprintln(os.Stderr, "tracepump: error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(once bool) error {
+func run(once, enrich bool) error {
 	if err := env.LoadDotEnv(defaultEnvFile); err != nil {
 		return err
 	}
@@ -76,6 +80,7 @@ func run(once bool) error {
 	cfg := pipeline.FetchConfig{
 		OutPath:   env.OrDefault("TRACEPUMP_OUT", defaultOutPath),
 		StatePath: env.OrDefault("TRACEPUMP_STATE", defaultStatePath),
+		Enrich:    enrich,
 	}
 
 	interval := defaultInterval
@@ -126,6 +131,12 @@ func run(once bool) error {
 
 		backoff = initialBackoff
 		fmt.Fprintf(os.Stderr, "tracepump: poll ok, emitted %d new trace(s), skipped %d health-check(s)\n", emitted, skipped)
+		if enrich {
+			c := fetcher.EnrichCounters()
+			if c.Attempted > 0 {
+				fmt.Fprintf(os.Stderr, "tracepump: enrichment: attempted %d, succeeded %d, skipped %d, failed %d\n", c.Attempted, c.Succeeded, c.Skipped, c.Failed)
+			}
+		}
 		if err := fetcher.SaveCheckpoint(); err != nil {
 			fmt.Fprintf(os.Stderr, "tracepump: checkpoint save failed: %v\n", err)
 		}

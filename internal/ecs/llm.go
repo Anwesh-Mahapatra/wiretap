@@ -30,6 +30,18 @@ type llm struct {
 	Messages     string `json:"messages"`
 	MessageCount int    `json:"message_count"`
 	OutputLength int    `json:"output_length"`
+	// GenerationCount is how many GENERATION observations Langfuse
+	// reported for this trace -- almost always 1, but a multi-turn or
+	// retried exchange can report more (see internal/parse's
+	// applyGenerations). Always present, never omitted: 0 genuinely means
+	// "no observation detail was available" (see model.LLMEvent's own
+	// doc comment), which is itself worth an analyst seeing rather than
+	// hiding. Exists specifically so InputTokens/OutputTokens above,
+	// which are *summed* across every generation, are never shown without
+	// the context of how many calls they summarize -- a token total with
+	// no indication it was a sum would misleadingly read as one call's
+	// cost.
+	GenerationCount int `json:"generation_count"`
 	// TotalCostUSD is another ECS gap, not a content field: the Gen AI
 	// field group (docs/reference/ecs-gen_ai.md) has no cost field at all.
 	// Pointer, not a plain float64, because a genuinely-unreported cost

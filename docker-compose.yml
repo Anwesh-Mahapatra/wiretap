@@ -236,65 +236,43 @@ services:
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
 
-  # One-shot: the tracepump image's distroless "nonroot" base runs as
-  # UID/GID 65532, but Docker creates a brand-new named volume owned by
-  # root:root -- confirmed by inspecting a fresh tracepump_data volume, which
-  # made tracepump crash-loop on "permission denied" trying to create its
-  # output file. This fixes ownership once before tracepump starts, the same
-  # pattern kibana_settings uses to bootstrap Kibana above.
-  tracepump-init:
-    image: busybox
-    restart: "no"
-    command: ["chown", "65532:65532", "/data"]
-    volumes:
-      - tracepump_data:/data
-
-  # Same fix, same reasoning, for wiretapd's own state volume -- confirmed
-  # by trial run: wiretapd crash-looped identically on
-  # "/state/wiretapd-index-state.json.tmp: permission denied" against a
-  # freshly created wiretapd_state volume until this ran first.
+  # One-shot: the wiretapd image's distroless "nonroot" base runs as
+  # UID/GID 65532, but Docker creates brand-new named volumes owned by
+  # root:root -- confirmed by inspecting fresh volumes, which made
+  # wiretapd crash-loop on "permission denied" trying to write its archive
+  # and checkpoints. This fixes ownership once before wiretapd starts, the
+  # same pattern kibana_settings uses to bootstrap Kibana above.
   wiretapd-init:
     image: busybox
     restart: "no"
-    command: ["chown", "65532:65532", "/state"]
+    command: ["sh", "-c", "chown 65532:65532 /data /state"]
     volumes:
+      - tracepump_data:/data
       - wiretapd_state:/state
 
-  tracepump:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: tracepump
-    restart: unless-stopped
-    depends_on:
-      langfuse-web:
-        condition: service_started
-      tracepump-init:
-        condition: service_completed_successfully
-    env_file:
-      - .env
-    environment:
-      # Inside this container, "localhost" would mean the tracepump
-      # container itself, not the langfuse-web service -- must use the
-      # Compose service name instead. tracescope, run from the host, still
-      # uses LANGFUSE_BASE_URL=http://localhost:3000 (its own default), so
-      # these two are deliberately not the same value.
-      LANGFUSE_BASE_URL: http://langfuse-web:3000
-      # Without this, the checkpoint would default to a relative path under
-      # the container's own working directory (/home/nonroot, confirmed by
-      # inspecting the base image) -- outside the /data volume below -- and
-      # get silently wiped on every container recreation, re-emitting every
-      # trace from scratch each time.
-      TRACEPUMP_STATE: /data/tracepump-state.json
-    volumes:
-      - tracepump_data:/data # read-write here; wiretapd (see below) mounts the same volume, read-only when it isn't the one fetching
-
   # --- wiretapd: the ingestion daemon ------------------------------------------
-  # Fetches (unless --no-fetch), archives, maps to ECS, and bulk-indexes into
-  # Elasticsearch -- see internal/pipeline and cmd/wiretapd. Defaults to
-  # --no-fetch because tracepump (above) already polls Langfuse and writes
-  # the archive; running a second fetcher here too would just double the API
-  # calls against Langfuse for no benefit.
+  # Fetches from Langfuse, enriches each new trace (see internal/pipeline's
+  # fetch enrichment), archives, maps to ECS, and bulk-indexes into
+  # Elasticsearch -- see internal/pipeline and cmd/wiretapd. This one
+  # service does the whole pipeline; there is no separate fetcher.
+  #
+  # Earlier revisions of this stack ran tracepump as a second, separate
+  # fetcher (a deliberately dumb, unenriched pipe) with wiretapd set to
+  # --no-fetch and only indexing what tracepump wrote. That combination
+  # meant *nothing* in the default stack ever called Langfuse's
+  # trace-detail endpoint -- tracepump doesn't enrich by design, and
+  # wiretapd wasn't fetching, so enrichment (the fix for gen_ai.usage.*,
+  # gen_ai.request/response.model, etc. always being empty -- see notes.md)
+  # never actually ran, despite every unit test passing. Running both
+  # services also risked a real race: each fetcher has its own checkpoint,
+  # so the same trace could land in the archive twice -- once unenriched
+  # from tracepump, once enriched from wiretapd -- with whichever got
+  # indexed last silently winning. wiretapd's own Fetcher is a strict
+  # superset of tracepump's (same code, see internal/pipeline/fetch.go),
+  # so the fix is this one service, not two. cmd/tracepump itself still
+  # exists and still works standalone (`go run ./cmd/tracepump`) for
+  # anyone who specifically wants the separate, unenriched-by-default
+  # pipe; it's just not part of this compose file's default services.
   wiretapd:
     build:
       context: .
@@ -311,8 +289,7 @@ services:
     env_file:
       - .env
     environment:
-      # Same reasoning as tracepump's LANGFUSE_BASE_URL override above:
-      # inside this container, "localhost" means this container itself,
+      # Inside this container, "localhost" means this container itself,
       # not the langfuse-web/elasticsearch services -- must use the
       # Compose service names instead. This is the single most common
       # local-vs-container mistake in this stack: getting it wrong doesn't
@@ -333,25 +310,20 @@ services:
       WIRETAPD_INDEX_STATE: /state/wiretapd-index-state.json
       WIRETAPD_FETCH_STATE: /state/wiretapd-fetch-state.json
     volumes:
-      # Read-only: this service defaults to --no-fetch (see "command"
-      # below), so it only ever reads /data, never writes the archive. If
-      # you switch it to running its own fetch stage instead of
-      # tracepump's, change this to read-write.
-      - tracepump_data:/data:ro
+      # Read-write: wiretapd is this stack's only fetcher, so it's the one
+      # writing the archive now, not just reading it.
+      - tracepump_data:/data
       # wiretapd's own checkpoint(s) live here, not in tracepump_data,
-      # specifically so they can always be written regardless of whether
-      # the /data mount above is read-only -- a read-only /data would
-      # otherwise make persisting the index checkpoint impossible even
-      # though wiretapd never needs to write the archive itself.
+      # specifically so they can always be written even if /data were ever
+      # mounted read-only in some other deployment of this image.
       - wiretapd_state:/state
-    # To run wiretapd's own fetch stage instead of relying on tracepump:
-    # stop the tracepump service, change the /data mount above to
-    # read-write, and change this command to just ["run"] (drop --no-fetch).
+    # Enrichment is on by default (no --no-enrich here) -- see
+    # cmd/wiretapd's --no-enrich flag for what's lost by disabling it.
     # To run wiretapd standalone from the host instead of as a container
     # at all (e.g. for `bootstrap`/`check`/`backfill` during development),
     # see RUNBOOK.md -- LANGFUSE_BASE_URL and ELASTICSEARCH_URL default to
     # localhost there, matching tracescope's own convention.
-    command: ["run", "--no-fetch"]
+    command: ["run"]
 
   # --- Elasticsearch destination (local) --------------------------------------
   # Single-node, security-enabled ES + Kibana. wiretapd owns index template
@@ -469,7 +441,7 @@ volumes:
     driver: local
   langfuse_redis_data:
     driver: local
-  tracepump_data:
+  tracepump_data: # the NDJSON archive; named for this project's history, written by wiretapd (see the wiretapd service's own comment above)
     driver: local
   wiretapd_state:
     driver: local

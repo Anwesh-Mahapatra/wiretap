@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -93,6 +94,15 @@ type Usage struct {
 // carry these -- only ID strings, inline on each trace's own "observations"
 // field -- which is why token counts and the answering model are only ever
 // available after a GetTrace call.
+//
+// The real response carries roughly 40 fields (confirmed by capturing a
+// live GET /api/public/traces/{id} response -- see
+// internal/langfuse/testdata/detail_truncated.json); this struct models
+// exactly the ones something downstream reads. Everything else is silently
+// dropped by encoding/json, which is correct for fields nothing needs --
+// but Metadata and ModelParameters below were *wrongly* being dropped
+// until this change, because gen_ai.request.model and
+// gen_ai.request.max_tokens live inside them and nowhere else.
 type Observation struct {
 	ID        string  `json:"id"`
 	Type      string  `json:"type"`
@@ -104,6 +114,57 @@ type Observation struct {
 	Latency   float64 `json:"latency"`
 	StartTime string  `json:"startTime"`
 	EndTime   string  `json:"endTime"`
+
+	Metadata        ObservationMetadata        `json:"metadata"`
+	ModelParameters ObservationModelParameters `json:"modelParameters"`
+}
+
+// ObservationMetadata is the subset of an observation's metadata this
+// project reads. The real object is a large LiteLLM-internal blob --
+// auth/budget/routing plumbing, dozens of fields -- with no Langfuse
+// meaning of its own; only ModelGroup is modeled here.
+type ObservationMetadata struct {
+	// ModelGroup is the model the *caller* requested (e.g.
+	// "llama-3.3-70b-versatile"), as distinct from Observation.Model, the
+	// model that actually answered (e.g. "groq/llama-3.3-70b-versatile"
+	// -- LiteLLM's provider-prefixed deployment name). Confirmed present
+	// and consistently different from Observation.Model across every
+	// trace this project has captured. This is a LiteLLM convention
+	// surfaced through Langfuse's generic metadata field, not a
+	// documented Langfuse concept -- there is no contract guaranteeing it
+	// stays here across LiteLLM versions.
+	ModelGroup string `json:"model_group"`
+}
+
+// ObservationModelParameters is the subset of an observation's
+// modelParameters this project reads. Real data also carries stream,
+// max_retries, extra_body, and system_fingerprint; none of those are
+// modeled because nothing downstream reads them. MaxTokens is a pointer
+// because it is only present when the caller actually set max_tokens on
+// the request (confirmed: present and 5 on a trace whose scenario set
+// maxTokens: 5; the key is simply absent, not present-and-zero, on traces
+// whose scenario didn't) -- a plain int would make "not set" and "set to
+// 0" indistinguishable.
+type ObservationModelParameters struct {
+	MaxTokens *int `json:"max_tokens"`
+}
+
+// CompletionID extracts the provider's completion ID (e.g.
+// "chatcmpl-da63253c-b51b-4557-9cc4-c3ed0aa1b9dd") from the observation's
+// own ID. This project's Langfuse integration constructs observation IDs
+// as "time-<HHMMSS-ffffff>_<completionID>" -- confirmed against every
+// trace this project has captured. There is no dedicated Langfuse field
+// for the completion ID, so this is a typed accessor rather than a struct
+// tag: a plain `json:"id"` field would hide that Observation.ID is doing
+// double duty, and a future LiteLLM/Langfuse version could change this
+// naming convention without changing the field name, which a struct tag
+// would not surface but a failing accessor test would.
+func (o Observation) CompletionID() (id string, ok bool) {
+	_, after, found := strings.Cut(o.ID, "_")
+	if !found || after == "" {
+		return "", false
+	}
+	return after, true
 }
 
 // Trace is a single Langfuse trace as returned by the trace-detail
@@ -120,15 +181,29 @@ type Trace struct {
 	Observations []Observation `json:"observations"`
 }
 
-// GetTrace fetches one trace by ID, with observations expanded to full
-// objects rather than the ID strings ListTraces returns.
-func (c *Client) GetTrace(ctx context.Context, id string) (*Trace, error) {
+// GetTraceRaw fetches one trace by ID and returns the response body exactly
+// as Langfuse sent it, undecoded. Exists for callers that need to archive
+// the detail response byte-for-byte (see internal/pipeline's fetch
+// enrichment) rather than round-trip it through Trace, which would only
+// preserve the subset of fields this package's structs declare -- silently
+// dropping the rest, which is fine for typed access but not for an archive
+// meant to be a faithful record of what the API actually returned.
+func (c *Client) GetTraceRaw(ctx context.Context, id string) (json.RawMessage, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/public/traces/"+url.PathEscape(id), nil)
 	if err != nil {
 		return nil, err
 	}
-
 	body, err := c.do(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(body), nil
+}
+
+// GetTrace fetches one trace by ID, with observations expanded to full
+// objects rather than the ID strings ListTraces returns.
+func (c *Client) GetTrace(ctx context.Context, id string) (*Trace, error) {
+	body, err := c.GetTraceRaw(ctx, id)
 	if err != nil {
 		return nil, err
 	}

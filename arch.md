@@ -80,6 +80,61 @@ Elasticsearch outage stalls the indexer's checkpoint, but the fetcher keeps
 right on pulling from Langfuse regardless, because nothing ties them
 together except the file.
 
+## Two Langfuse endpoints, one archive: the enrichment tradeoff
+
+Langfuse's public API has two different ways to ask about a trace, and
+they return meaningfully different amounts of detail:
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /api/public/traces` (list, paginated) | Every trace on the page, but each one's `observations` field is just an array of ID strings — a pointer, not the data. |
+| `GET /api/public/traces/{id}` (detail, one trace) | The same trace, but `observations` is now an array of full objects — and only those full objects carry token counts, the model that actually answered, and a few other fields this project needs. |
+
+For a while, this project's fetch stage only ever called the list
+endpoint. Every trace still got archived and indexed — but with
+`observations` reduced to bare ID strings, none of the token-count or
+model-name fields in `gen_ai.*` had anything to read, so they were always
+absent. Every test still passed (correctly: absent is the honest
+representation of "we never fetched that data," not a bug), and the
+mapper's own code was never at fault — the gap was entirely in what got
+fetched. See `notes.md` for this as a worked example.
+
+The fix, called **enrichment** in this codebase, is straightforward in
+concept and has one real cost: for every new trace the list endpoint
+reports, the fetch stage now makes a *second* API call to the detail
+endpoint to get the full observation objects, then archives that richer
+response instead of the list-shaped one. That's **N+1 requests** for a
+page of N new traces — a real, ongoing cost in API calls against Langfuse,
+traded for fields that would otherwise always be empty. `internal/pipeline`
+bounds this with a small worker pool (4 concurrent requests by default,
+configurable) rather than firing all N at once, and treats a single
+trace's enrichment failure as *that trace's* problem — skipped and
+retried on the next poll — rather than letting one flaky request block
+every other trace on the page. See `internal/pipeline/enrich.go`'s own
+doc comments for the retry/backoff coordination details.
+
+```mermaid
+sequenceDiagram
+    participant WD as wiretapd (fetch stage)
+    participant LF as Langfuse
+
+    WD->>LF: GET /api/public/traces (list, page N)
+    LF-->>WD: traces, each with observations: ["id1", "id2", ...]
+
+    loop for each new trace, bounded concurrency
+        WD->>LF: GET /api/public/traces/{id} (detail)
+        LF-->>WD: same trace, observations: [{full object}, ...]
+        WD->>WD: archive the DETAIL response<br/>(not the list one)
+    end
+```
+
+The archive still holds exactly one real API response per line, byte-for-
+byte, faithful to what Langfuse actually sent — enrichment changes *which*
+response gets archived (detail instead of list), never rewrites one after
+the fact. That property is what makes `wiretapd backfill` safe here too:
+replaying the archive re-parses real, complete API responses, not a
+patched-up approximation of one.
+
 ## Why parsing and mapping are two separate steps (`internal/model`)
 
 Langfuse's JSON shape is an *input* detail. ECS's field names are an
@@ -163,6 +218,20 @@ exists to support.
 
 ## End-to-end sequence
 
+`wiretapd` is the only ingestion service in the default deployment: it
+fetches from Langfuse (enriching each new trace as it goes, see above),
+archives, maps, and indexes, all in one process with two independently-
+paced loops sharing nothing but the archive file (see "why a plain file
+sits in the middle," above, for why that's deliberate). An earlier
+revision of this stack split fetching into a second, separate service
+(`tracepump`) — removed once it became clear that combination could leave
+enrichment silently never running at all (see `notes.md`'s worked
+example) and risked a real timing race between two independent fetchers
+writing the same archive. `cmd/tracepump` still exists as a standalone
+tool for anyone who specifically wants a plain, unenriched, faithful pipe
+with nothing else attached; it's just not part of the default compose
+services anymore.
+
 ```mermaid
 sequenceDiagram
     participant You as You
@@ -170,9 +239,8 @@ sequenceDiagram
     participant LL as LiteLLM
     participant Groq as Groq
     participant LF as Langfuse
-    participant TP as tracepump
-    participant Archive as NDJSON archive
     participant WD as wiretapd
+    participant Archive as NDJSON archive
     participant ES as Elasticsearch
     participant KB as Kibana
 
@@ -183,13 +251,15 @@ sequenceDiagram
     LL-->>WT: response
     LL--)LF: log prompt + response (async)
 
-    loop every 30s
-        TP->>LF: poll for new traces
-        LF-->>TP: raw trace JSON
-        TP->>Archive: append line (unmodified)
+    loop every 30s: fetch
+        WD->>LF: poll for new traces (list)
+        LF-->>WD: new trace IDs
+        WD->>LF: fetch full detail per new trace (enrichment)
+        LF-->>WD: enriched trace JSON
+        WD->>Archive: append line (unmodified, once fetched)
     end
 
-    loop every 10s
+    loop every 10s: index
         WD->>Archive: read new lines
         WD->>WD: parse -> LLMEvent -> ECS document
         WD->>ES: bulk index (_id = trace ID)
