@@ -227,3 +227,166 @@ mean either the detection query or the mapping itself is scoped wrong, and
 either one silently turns a precise detection into permanent background
 noise.
 
+
+### Array order is not chronological order (and the bug that hid behind one generation)
+
+`internal/parse`'s `applyGenerations` has always documented a rule for
+traces with more than one generation: token counts get *summed*, while
+single-valued fields (the answering model, the completion ID,
+`max_tokens`) take the **last** generation, because in a retried or
+multi-turn exchange the final call is the one that produced the output.
+
+That comment was right about intent and wrong about mechanism. The code
+iterated Langfuse's `observations` array front to back and let later
+iterations overwrite earlier ones — so "last" meant *last array element*,
+and the comment's "last" meant *latest in time*. Those are only the same
+thing if the array happens to be sorted, and **Langfuse does not sort it**.
+Nothing in Langfuse's API documentation says it does, and nothing in this
+project ever checked.
+
+It stayed invisible for a simple reason: **every real trace this project
+had ever captured contained exactly one generation.** With one element,
+array position and chronology cannot disagree. The assumption was load-
+bearing, undocumented, untested, and unfalsifiable by the data on hand.
+
+What exposed it was not reading the code more carefully. It was
+*deliberately constructing the case that could disagree* — sending one
+request that got refused and a second, later request reusing the same
+`trace_id` that succeeded, producing a trace with three generations
+spanning two outcomes. Langfuse returned them like this:
+
+```
+array position    startTime                  level     model
+  [0]             2026-07-31T10:43:12.078Z   DEFAULT   groq/llama-3.3-70b-versatile
+  [1]             2026-07-31T10:43:11.033Z   ERROR     llama-3.3-70b-versatile
+  [2]             2026-07-31T10:43:11.033Z   ERROR     llama-3.3-70b-versatile
+```
+
+The chronologically *first* events are listed *last*. Array-order last-wins
+therefore picked an ERROR observation and reported
+`gen_ai.response.model: "llama-3.3-70b-versatile"` — the unprefixed model
+the caller *requested*, on a request where a different, provider-prefixed
+model had actually answered. A real field, a real-looking value, and the
+wrong answer: the same failure shape as the merged-traces bug above, and
+as the empty `gen_ai.*` fields below it.
+
+Two things are worth separating here, because only one of them is the
+lesson.
+
+**The fix** is small: sort GENERATION observations by `startTime` before
+applying last-wins (`orderedGenerations`), with observations that carry no
+parseable `startTime` sorted first so an unorderable record can never win
+over one that can be placed in time. That took an afternoon and is pinned
+by `TestParseLine_TwoSuccesses_ResolveByTimeNotArrayPosition`, whose
+fixture lists two *successful* generations latest-first — because the
+ERROR/non-ERROR split fixed the symptom on mixed traces while leaving the
+underlying ordering assumption untouched for two successes.
+
+**The lesson** is that the bug was undetectable by any amount of care
+applied to the existing data. Every test passed. Every document validated.
+The mapper was never at fault. The gap was that the only shape that could
+falsify the assumption had never been produced, and producing it required
+someone to ask "what would have to be true for this to be wrong?" and then
+go and *make that case exist*.
+
+The general form, and the reason this is worth writing down: **when a
+system's real data happens to be degenerate — one element, one provider,
+one outcome — every assumption about plurality is untested, and looks
+tested.** This repository has now hit that exact shape three times:
+
+- one trace ID per session (until two scenarios shared a session and merged),
+- one provider (`gen_ai.system` hardcoded to `"groq"`, correct only until a second provider exists),
+- one generation per trace (array order standing in for chronology).
+
+None of these produced an error, an empty field, or a failing test. All
+three produced confident, well-formed, wrong data. The defence is not more
+review; it is deliberately manufacturing the plural case — a second
+scenario, a second provider, a second generation — *before* trusting code
+that quietly assumes there is only ever one.
+
+### The constant standing in for a value with no second example
+
+Three times now this project has shipped a field that was correct, well-
+formed, tested, and wrong the moment the world grew a second of something.
+They are the same bug, and it is worth naming the shape rather than fixing
+instances as they surface.
+
+| Constant | Where | Correct while… | Wrong when… |
+|---|---|---|---|
+| `gen_ai.system: "groq"` | `internal/ecs/map.go` | exactly one provider is configured | a second entry lands in `config.yaml`'s `model_list` — every document then claims `groq` regardless of who served it |
+| `gen_ai.operation.name: "chat"` | `internal/ecs/map.go` | only `/chat/completions` is ever called | an embeddings or completions call arrives |
+| `event.dataset: "wiretap.langfuse"` | `internal/ecs/map.go` | exactly one log source exists | the gateway plane arrives and every gateway document claims to be a Langfuse document |
+
+**The general form:** *a constant standing in for a value that has no
+second example yet.* It is not a magic number and it is not a bad default.
+It is a value that is genuinely, verifiably correct today, written down as
+a literal because at the time there was nothing to distinguish it from —
+and which becomes a confident lie the day a second case appears, without
+throwing, without failing a test, and without an empty field to notice.
+
+This is the same family as the entries above it. The merged-traces bug was
+one trace ID per session. The empty `gen_ai.*` fields were one fetch
+endpoint. Array-order-as-chronology was one generation per trace. In every
+case the codebase was not wrong about the world as it stood; it had
+recorded an accident of the present as if it were a property of the
+system.
+
+What makes this class specifically nasty is the failure signature. A
+missing field is visible — it shows up as absent, someone asks why. A
+*wrong* field is invisible, because it is populated, plausible, and of the
+right type. `gen_ai.system: "groq"` on a document served by OpenAI does
+not look broken from any angle a dashboard offers.
+
+**The defence is a deliberate search, not an incidental one.** These three
+were each found by accident — while fixing something else, or because a
+task brief happened to name one. That is not a strategy. Below is the
+result of actually going looking, once, on purpose. Nothing here is
+claimed to be a bug today; the point is that the list exists and that
+where these live is now written down rather than rediscovered.
+
+**Live in the ECS document, therefore in every indexed record:**
+
+- `internal/ecs/map.go` — `GenAISystem: "groq"` (fix scheduled: derive
+  from the model prefix)
+- `internal/ecs/map.go` — `GenAIOperationName: "chat"`
+- `internal/ecs/map.go` — `Dataset: "wiretap.langfuse"` (must become a
+  parameter for the gateway mapper)
+- `internal/ecs/map.go` — `Category: []string{"api"}`, a single-element
+  slice on a field ECS defines as an array. An authentication failure
+  should arguably carry `["api", "authentication"]`.
+- `internal/ecs/map.go` — `Kind: "event"`, `Module: "wiretap"`. Both are
+  genuinely fixed properties of this pipeline rather than accidents, and
+  are listed only so the survey is complete rather than selective.
+
+**Structural, in the storage layer:**
+
+- `internal/esink/bootstrap.go` — `concreteIndex()` returns
+  `IndexBase + "-000001"`. One index, forever; there is no rollover. Fine
+  at lab volume, and a real ceiling if this ever ingests production
+  traffic.
+- `internal/esink/bootstrap.go` — `number_of_shards: 1`,
+  `number_of_replicas: 0`. Deliberate for a single-node cluster and
+  documented as such.
+
+**Assumptions about the traffic, not the schema:**
+
+- `internal/parse/parse.go` — `scenarioNamePrefix = "wiretap-"`. Every
+  trace is assumed to be a wiretap scenario or nothing; real traffic from
+  another client is neither, which is handled (`Outcome` stays empty), but
+  the naming reads as if wiretap is the only caller.
+- `internal/pipeline/fetch.go` — `healthCheckTag`, one tag identifying one
+  kind of synthetic traffic. A second health-check mechanism would not be
+  filtered.
+- `internal/pipeline/fetch.go` — `OrderBy: "timestamp.asc"`, correct and
+  load-bearing for checkpointing, but a single ordering assumed to be the
+  only sensible one.
+- `cmd/wiretapd/config.go` — one `LANGFUSE_BASE_URL`, one Langfuse
+  project. Multi-project or multi-tenant ingestion is not expressible.
+
+**The rule going forward:** when writing a literal into a field that
+*describes* something — a provider, a dataset, an operation, a category —
+stop and ask whether the value is a property of the system or an accident
+of its current size. If it is the latter, either derive it or leave a
+comment saying which second example will break it. All three of the bugs
+above would have been caught by that question, and none of them were
+caught by review.

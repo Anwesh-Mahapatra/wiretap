@@ -1,0 +1,103 @@
+{
+  "data": [
+    {
+      "request_id": "chatcmpl-ec75bd8c-8357-4422-a9c2-6d987b7552e6",
+      "call_type": "acompletion",
+      "api_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "spend": 2.341e-05,
+      "total_tokens": 39,
+      "prompt_tokens": 37,
+      "completion_tokens": 2,
+      "startTime": "2026-07-30T23:02:34.989+00:00",
+      "endTime": "2026-07-30T23:02:35.273+00:00",
+      "completionStartTime": "2026-07-30T23:02:35.273+00:00",
+      "model": "groq/llama-3.3-70b-versatile",
+      "model_id": "9ae42a7b54fc3b24c1456cc89d2708e6659f6dd8b3cbc7360d3eb792918d71fb",
+      "model_group": "llama-3.3-70b-versatile",
+      "custom_llm_provider": "groq",
+      "api_base": "https://api.groq.com/openai/v1/chat/completions",
+      "user": "",
+      "metadata": {
+        "status": null,
+        "max_retries": 2,
+        "batch_models": null,
+        "usage_object": {
+          "queue_time": 0.162852414,
+          "total_time": 0.008603242,
+          "prompt_time": 0.001961285,
+          "total_tokens": 39,
+          "prompt_tokens": 37,
+          "completion_time": 0.006641957,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "user_api_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cost_breakdown": {
+          "input_cost": 2.183e-05,
+          "total_cost": 2.3409999999999998e-05,
+          "output_cost": 1.58e-06,
+          "original_cost": 2.3409999999999998e-05,
+          "margin_percent": 0.0,
+          "discount_amount": 0.0,
+          "tool_usage_cost": 0.0,
+          "discount_percent": 0.0,
+          "margin_fixed_amount": 0.0,
+          "margin_total_amount": 0.0
+        },
+        "litellm_call_id": "eb41c150-9405-4fef-a85d-d3c82de26a7e",
+        "eval_information": null,
+        "attempted_retries": 0,
+        "error_information": null,
+        "applied_guardrails": [],
+        "user_api_key_alias": "probe-budget-1",
+        "spend_logs_metadata": {
+          "trace_id": "probe-success-e7915e6d00661154"
+        },
+        "user_api_key_org_id": null,
+        "proxy_server_request": null,
+        "requester_ip_address": "172.18.0.1",
+        "user_api_key_team_id": null,
+        "user_api_key_user_id": null,
+        "guardrail_information": null,
+        "mcp_tool_call_metadata": null,
+        "additional_usage_values": {
+          "queue_time": 0.162852414,
+          "total_time": 0.008603242,
+          "prompt_time": 0.001961285,
+          "completion_time": 0.006641957,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "cold_storage_object_key": null,
+        "user_api_key_project_id": null,
+        "user_api_key_team_alias": null,
+        "litellm_overhead_time_ms": 1.461,
+        "user_api_key_project_alias": null,
+        "vector_store_request_metadata": null
+      },
+      "cache_hit": "None",
+      "cache_key": "Cache OFF",
+      "request_tags": [
+        "wiretap",
+        "probe",
+        "User-Agent: curl",
+        "User-Agent: curl/8.5.0"
+      ],
+      "team_id": "",
+      "organization_id": "",
+      "end_user": "",
+      "requester_ip_address": "172.18.0.1",
+      "session_id": "probe-session",
+      "status": "success",
+      "mcp_namespaced_tool_name": null,
+      "agent_id": null,
+      "request_duration_ms": 284
+    }
+  ],
+  "total": 10000,
+  "page": 1,
+  "page_size": 100,
+  "total_pages": 100,
+  "total_is_capped": true
+}

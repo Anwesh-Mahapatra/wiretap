@@ -1,0 +1,208 @@
+{
+  "id": "probe-authfail-b469cbc39f389eea",
+  "projectId": "cmrwcw1jr0006mg078bikhxe9",
+  "name": "litellm-acompletion",
+  "timestamp": "2026-07-30T23:03:11.207Z",
+  "environment": "default",
+  "tags": [
+    "probe-authfail",
+    "wiretap"
+  ],
+  "bookmarked": false,
+  "release": null,
+  "version": null,
+  "userId": null,
+  "sessionId": null,
+  "public": false,
+  "input": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello"
+      }
+    ]
+  },
+  "output": null,
+  "metadata": {},
+  "createdAt": "2026-07-30T23:03:11.831Z",
+  "updatedAt": "2026-07-30T23:03:16.857Z",
+  "externalId": null,
+  "scores": [],
+  "latency": 0.006,
+  "observations": [
+    {
+      "id": "bb0c9f90-820c-4ac6-ab3b-f14c1e6d39f2",
+      "traceId": "probe-authfail-b469cbc39f389eea",
+      "startTime": "2026-07-30T23:03:11.204Z",
+      "endTime": "2026-07-30T23:03:11.205Z",
+      "projectId": "cmrwcw1jr0006mg078bikhxe9",
+      "parentObservationId": null,
+      "type": "GENERATION",
+      "environment": "default",
+      "name": "litellm-acompletion",
+      "level": "ERROR",
+      "statusMessage": "Authentication Error, Invalid proxy server token passed. key=1111111111111111111111111111111111111111111111111111111111111111, not found in db. Create key via `/key/generate` call.",
+      "version": null,
+      "createdAt": "2026-07-30T23:03:11.832Z",
+      "updatedAt": "2026-07-30T23:03:16.873Z",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "output": "Authentication Error, Invalid proxy server token passed. key=1111111111111111111111111111111111111111111111111111111111111111, not found in db. Create key via `/key/generate` call.",
+      "metadata": {
+        "tags": [
+          "wiretap",
+          "probe-authfail"
+        ],
+        "spend_logs_metadata": {
+          "trace_id": "probe-authfail-b469cbc39f389eea"
+        },
+        "user_api_key_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "user_api_key_alias": null,
+        "user_api_key_spend": 0,
+        "user_api_key_max_budget": null,
+        "user_api_key_team_id": null,
+        "user_api_key_project_id": null,
+        "user_api_key_project_alias": null,
+        "user_api_key_user_id": null,
+        "user_api_key_org_id": null,
+        "user_api_key_org_alias": null,
+        "user_api_key_team_alias": null,
+        "user_api_key_end_user_id": null,
+        "user_api_key_user_email": null,
+        "user_api_key_request_route": "/chat/completions",
+        "user_api_key_budget_reset_at": null,
+        "user_api_key_auth_metadata": {},
+        "litellm_response_cost": 0,
+        "hidden_params": {
+          "response_cost": 0
+        },
+        "requester_metadata": {}
+      },
+      "model": "llama-3.3-70b-versatile",
+      "modelParameters": {
+        "messages": "[{'role': 'user', 'content': 'hello'}]"
+      },
+      "completionStartTime": null,
+      "promptId": null,
+      "promptName": null,
+      "promptVersion": null,
+      "latency": 0.001,
+      "timeToFirstToken": null,
+      "usageDetails": {},
+      "costDetails": {},
+      "usagePricingTierId": null,
+      "usagePricingTierName": null,
+      "inputPrice": 0,
+      "outputPrice": 0,
+      "totalPrice": 0,
+      "calculatedInputCost": null,
+      "calculatedOutputCost": null,
+      "calculatedTotalCost": 0,
+      "unit": "TOKENS",
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0,
+      "modelId": null,
+      "usage": {
+        "unit": "TOKENS",
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    },
+    {
+      "id": "f07a71ba-f227-449d-a04b-66ab11a6418b",
+      "traceId": "probe-authfail-b469cbc39f389eea",
+      "startTime": "2026-07-30T23:03:11.204Z",
+      "endTime": "2026-07-30T23:03:11.210Z",
+      "projectId": "cmrwcw1jr0006mg078bikhxe9",
+      "parentObservationId": null,
+      "type": "GENERATION",
+      "environment": "default",
+      "name": "litellm-acompletion",
+      "level": "ERROR",
+      "statusMessage": "Authentication Error, Invalid proxy server token passed. key=1111111111111111111111111111111111111111111111111111111111111111, not found in db. Create key via `/key/generate` call.",
+      "version": null,
+      "createdAt": "2026-07-30T23:03:11.832Z",
+      "updatedAt": "2026-07-30T23:03:16.872Z",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "output": "Authentication Error, Invalid proxy server token passed. key=1111111111111111111111111111111111111111111111111111111111111111, not found in db. Create key via `/key/generate` call.",
+      "metadata": {
+        "tags": [
+          "wiretap",
+          "probe-authfail"
+        ],
+        "spend_logs_metadata": {
+          "trace_id": "probe-authfail-b469cbc39f389eea"
+        },
+        "user_api_key_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "user_api_key_alias": null,
+        "user_api_key_spend": 0,
+        "user_api_key_max_budget": null,
+        "user_api_key_team_id": null,
+        "user_api_key_project_id": null,
+        "user_api_key_project_alias": null,
+        "user_api_key_user_id": null,
+        "user_api_key_org_id": null,
+        "user_api_key_org_alias": null,
+        "user_api_key_team_alias": null,
+        "user_api_key_end_user_id": null,
+        "user_api_key_user_email": null,
+        "user_api_key_request_route": "/chat/completions",
+        "user_api_key_budget_reset_at": null,
+        "user_api_key_auth_metadata": {},
+        "litellm_response_cost": 0,
+        "hidden_params": {
+          "response_cost": 0
+        },
+        "requester_metadata": {}
+      },
+      "model": "llama-3.3-70b-versatile",
+      "modelParameters": {
+        "messages": "[{'role': 'user', 'content': 'hello'}]"
+      },
+      "completionStartTime": null,
+      "promptId": null,
+      "promptName": null,
+      "promptVersion": null,
+      "latency": 0.006,
+      "timeToFirstToken": null,
+      "usageDetails": {},
+      "costDetails": {},
+      "usagePricingTierId": null,
+      "usagePricingTierName": null,
+      "inputPrice": 0,
+      "outputPrice": 0,
+      "totalPrice": 0,
+      "calculatedInputCost": null,
+      "calculatedOutputCost": null,
+      "calculatedTotalCost": 0,
+      "unit": "TOKENS",
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0,
+      "modelId": null,
+      "usage": {
+        "unit": "TOKENS",
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    }
+  ],
+  "htmlPath": "/project/cmrwcw1jr0006mg078bikhxe9/traces/probe-authfail-b469cbc39f389eea",
+  "totalCost": 0
+}

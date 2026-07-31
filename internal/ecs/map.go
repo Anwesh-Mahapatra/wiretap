@@ -62,21 +62,30 @@ func Map(ev *model.LLMEvent, cfg Config) *Document {
 			Module:   "wiretap",
 		},
 		LLM: llm{
-			SystemPrompt:    lastMessageContent(ev.Messages, "system"),
-			UserPrompt:      lastMessageContent(ev.Messages, "user"),
-			Output:          ev.OutputContent,
-			OutputRole:      ev.OutputRole,
-			Messages:        encodeMessages(ev.Messages),
-			MessageCount:    len(ev.Messages),
-			OutputLength:    len(ev.OutputContent),
-			TotalCostUSD:    ev.TotalCost,
-			GenerationCount: ev.GenerationCount,
+			SystemPrompt:           lastMessageContent(ev.Messages, "system"),
+			UserPrompt:             lastMessageContent(ev.Messages, "user"),
+			Output:                 ev.OutputContent,
+			OutputRole:             ev.OutputRole,
+			Messages:               encodeMessages(ev.Messages),
+			MessageCount:           len(ev.Messages),
+			OutputLength:           len(ev.OutputContent),
+			TotalCostUSD:           ev.TotalCost,
+			GenerationCount:        ev.GenerationCount,
+			ErroredGenerationCount: ev.ErroredGenerationCount,
 		},
 		Labels: labels{
 			WiretapOutcome:  string(ev.Outcome),
 			WiretapScenario: ev.TraceName,
 		},
 		Tags: ev.Tags,
+	}
+
+	// model.Status's constants are exactly ECS event.outcome's allowed
+	// values, so this is an assignment, not a mapping. StatusUnknown is
+	// the empty string and omitempty drops it -- see event.Outcome's doc.
+	doc.Event.Outcome = string(ev.Status)
+	if ev.StatusMessage != "" {
+		doc.Error = &ecsError{Message: ev.StatusMessage}
 	}
 
 	if !ev.RequestTimestamp.IsZero() {

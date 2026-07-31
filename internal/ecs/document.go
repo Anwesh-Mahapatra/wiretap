@@ -33,16 +33,41 @@ const ECSVersion = "9.4.0"
 // does not treat the same way without extra configuration this project
 // doesn't use.
 type Document struct {
-	Timestamp string   `json:"@timestamp,omitempty"`
-	ECS       ecsMeta  `json:"ecs"`
-	Event     event    `json:"event"`
-	Trace     *idField `json:"trace,omitempty"`
-	Session   *idField `json:"session,omitempty"`
-	User      *idField `json:"user,omitempty"`
-	GenAI     *genAI   `json:"gen_ai,omitempty"`
-	LLM       llm      `json:"llm"`
-	Labels    labels   `json:"labels"`
-	Tags      []string `json:"tags,omitempty"`
+	Timestamp string    `json:"@timestamp,omitempty"`
+	ECS       ecsMeta   `json:"ecs"`
+	Event     event     `json:"event"`
+	Trace     *idField  `json:"trace,omitempty"`
+	Session   *idField  `json:"session,omitempty"`
+	User      *idField  `json:"user,omitempty"`
+	GenAI     *genAI    `json:"gen_ai,omitempty"`
+	Error     *ecsError `json:"error,omitempty"`
+	LLM       llm       `json:"llm"`
+	Labels    labels    `json:"labels"`
+	Tags      []string  `json:"tags,omitempty"`
+}
+
+// ecsError holds ECS core error.* fields. Verified against Elastic's ECS
+// "error" field group reference (elastic.co/docs/reference/ecs/ecs-error)
+// on 2026-07-31:
+//   - error.message (match_only_text) -- "Error message." Carries the
+//     source's own explanation of why a request failed; for this
+//     project's Langfuse data that is an ERROR observation's
+//     statusMessage, which is LiteLLM's enforcement text verbatim.
+//
+// Only error.message is populated from the content plane. error.type
+// (the exception class) and error.code exist in ECS and map cleanly to
+// LiteLLM's structured error_information, but Langfuse carries neither --
+// classifying "Budget has been exceeded!" into a class would mean string
+// matching on a human-readable message, which is exactly the kind of
+// plausible-but-invented field this project refuses to emit. The gateway
+// plane reports both as structured data; that is one of the things it is
+// for, and where they will come from.
+//
+// Pointer so a document for a request that did not fail carries no error
+// object at all, rather than an empty one that a query for "does error
+// exist" would match.
+type ecsError struct {
+	Message string `json:"message,omitempty"`
 }
 
 type idField struct {
@@ -67,11 +92,20 @@ type ecsMeta struct {
 //     information about this event"; used here to carry the Langfuse UI
 //     link (see model.LLMEvent.SourceRef), so an analyst can click
 //     straight from a Kibana alert back into Langfuse's own trace view.
+//   - event.outcome (keyword) -- one of ECS's four categorization fields.
+//     Allowed values are exactly "success", "failure", "unknown"
+//     (verified 2026-07-31); model.Status is defined to those three
+//     strings so this is a direct assignment rather than a translation.
+//     Omitted entirely when the source gave no basis to decide, which is
+//     why this is omitempty and model.StatusUnknown is the empty string:
+//     an absent outcome and an explicit "unknown" would otherwise be two
+//     spellings of the same non-answer.
 type event struct {
 	Kind      string   `json:"kind"`
 	Category  []string `json:"category,omitempty"`
 	Dataset   string   `json:"dataset"`
 	Module    string   `json:"module"`
+	Outcome   string   `json:"outcome,omitempty"`
 	Duration  *int64   `json:"duration,omitempty"`
 	Ingested  string   `json:"ingested,omitempty"`
 	Reference string   `json:"reference,omitempty"`

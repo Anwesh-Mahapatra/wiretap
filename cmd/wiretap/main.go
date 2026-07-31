@@ -211,6 +211,24 @@ func run() error {
 			// and latency spans days instead of one request. This is not
 			// hypothetical; it already happened once. See notes.md.
 			option.WithJSONSet("metadata.trace_id", traceID),
+			// The same ID again, under the one key LiteLLM preserves into
+			// its own spend records. metadata.trace_id above reaches
+			// Langfuse (the content plane) and nothing else; LiteLLM does
+			// not forward arbitrary caller metadata into LiteLLM_SpendLogs,
+			// so without this line the gateway plane has no idea which
+			// request it is looking at and no cross-plane join is possible.
+			//
+			// Sending the same value twice under two keys is redundant and
+			// is the price of an exact join that also covers *refused*
+			// requests. The alternative join key -- the completion ID,
+			// which LiteLLM uses as the spend record's request_id -- only
+			// exists when a completion happened, so it covers precisely the
+			// requests the gateway plane is least needed for. A budget
+			// block or an auth failure has no completion ID, and
+			// session_id is no help either: LiteLLM discards the caller's
+			// session_id on a refusal and substitutes a random UUID.
+			// See docs/CORRELATION.md §2.
+			option.WithJSONSet("metadata.spend_logs_metadata.trace_id", traceID),
 		)
 		cancel()
 		if err != nil {

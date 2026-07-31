@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -123,15 +124,44 @@ type wireUsage struct {
 // needs: enough to find every generation that answered and read each
 // one's model, token usage, requested model, and max_tokens.
 type wireObservation struct {
-	ID              string                     `json:"id"`
-	Type            string                     `json:"type"`
-	Name            string                     `json:"name"`
-	Model           string                     `json:"model"`
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Name string `json:"name"`
+	// Model means different things depending on Level, and this is not a
+	// Langfuse subtlety but a LiteLLM one, confirmed against real captured
+	// data: on a non-ERROR observation it is the model that *answered*,
+	// provider-prefixed ("groq/llama-3.3-70b-versatile"); on an ERROR
+	// observation nothing answered, so it is the model the caller
+	// *requested*, unprefixed ("llama-3.3-70b-versatile"). applyGenerations
+	// routes it to ResponseModel or RequestModel accordingly -- mapping it
+	// unconditionally to ResponseModel would claim a model served a request
+	// it rejected.
+	Model string `json:"model"`
+	// Level is Langfuse's per-observation severity: "DEFAULT", "DEBUG",
+	// "WARNING", or "ERROR". This project's LiteLLM integration sets ERROR
+	// on every observation for a request the proxy refused (budget block,
+	// auth failure) via config.yaml's failure_callback -- so ERROR is how
+	// the *content* plane sees an enforcement action at all.
+	Level string `json:"level"`
+	// StatusMessage is the source's own explanation, populated alongside
+	// an ERROR level. For this deployment it is LiteLLM's enforcement text
+	// verbatim, e.g. "Budget has been exceeded! Key=bob (sk-...9SfA) ...".
+	// Note it already contains only LiteLLM's own truncated key suffix,
+	// never a usable credential.
+	StatusMessage string `json:"statusMessage"`
+	// StartTime is when this generation began, and it is the ONLY
+	// trustworthy way to order a trace's observations. Langfuse does not
+	// return them in chronological order -- see orderedGenerations.
+	StartTime       string                     `json:"startTime"`
 	Usage           *wireUsage                 `json:"usage"`
 	Latency         *float64                   `json:"latency"`
 	Metadata        wireObservationMetadata    `json:"metadata"`
 	ModelParameters wireObservationModelParams `json:"modelParameters"`
 }
+
+// observationLevelError is the Langfuse observation level this project's
+// LiteLLM integration uses for a request the proxy refused.
+const observationLevelError = "ERROR"
 
 // wireObservationMetadata is the subset of an observation's metadata this
 // parser reads. The real object is a large LiteLLM-internal blob --
@@ -291,26 +321,75 @@ func ParseLine(line []byte, lineNo int) (*model.LLMEvent, error) {
 // undercounts it, which is worse than reporting nothing: it's exactly the
 // syntactically-valid-but-semantically-false telemetry notes.md already
 // documents one incident of. Partial data here stays absent, not partial.
+//
+// ERROR-level generations get three specific, narrow treatments, because a
+// request the proxy refused is not a request that ran and cost nothing:
+//
+//   - Their Model feeds RequestModel, never ResponseModel. Nothing
+//     answered, so there is no answering model to report; what LiteLLM
+//     puts there is the model the caller asked for.
+//   - Their StatusMessage is carried onto the event, and Status becomes
+//     failure when *no* generation succeeded.
+//   - They are excluded from GenerationCount and from token summation
+//     entirely, and counted separately in ErroredGenerationCount. A
+//     refused attempt is not a call the model answered, so it must not
+//     inflate the count that exists to say how many answers a token sum
+//     summarizes. Langfuse itself agrees: a mixed trace's own
+//     trace-level totalCost equals the sum of the non-ERROR observations
+//     alone (verified on real data, 2026-07-31), so counting them here
+//     would put wiretap at odds with its own source.
+//   - When no generation succeeded, token counts and cost are left
+//     genuinely absent rather than the zeros Langfuse reports. Langfuse
+//     really does send usage {input:0, output:0} and calculatedTotalCost 0
+//     on a blocked request, and taking those literally is how a blocked
+//     request came to index as "a successful request that used no tokens
+//     and cost nothing" -- valid fields, plausible values, wrong answer.
+//     Zero is what the source said; absent is what it meant.
 func applyGenerations(ev *model.LLMEvent, obs []wireObservation) {
 	var inputSum, outputSum int
-	var generationsSeen, generationsWithUsage int
+	var succeeded, succeededWithUsage, errored int
 
-	for i := range obs {
-		if obs[i].Type != "GENERATION" {
+	for _, g := range orderedGenerations(obs) {
+		if g.Level == observationLevelError {
+			errored++
+			if ev.StatusMessage == "" && g.StatusMessage != "" {
+				// Chronologically-first message wins: every attempt of a
+				// blocked request reports the same enforcement text, and
+				// the first one is the reason the request failed. Later
+				// ones are repeats, not extra information. This is only
+				// meaningfully "first" because orderedGenerations sorted
+				// them; in array order it was whichever Langfuse listed
+				// first.
+				ev.StatusMessage = g.StatusMessage
+			}
+			// An ERROR observation still tells us which model the caller
+			// asked for -- nothing answered, so LiteLLM puts the
+			// requested model in the Model field. Everything else about
+			// it (usage, cost, completion ID) describes a call that
+			// never happened.
+			if g.Model != "" && ev.ResponseModel == "" {
+				ev.RequestModel = g.Model
+			}
+			if g.Metadata.ModelGroup != "" {
+				ev.RequestModel = g.Metadata.ModelGroup
+			}
+			if g.ModelParameters.MaxTokens != nil {
+				mt := *g.ModelParameters.MaxTokens
+				ev.MaxTokens = &mt
+			}
 			continue
 		}
-		g := &obs[i]
-		ev.GenerationCount++
-		generationsSeen++
 
+		succeeded++
 		if g.Usage != nil {
 			inputSum += g.Usage.Input
 			outputSum += g.Usage.Output
-			generationsWithUsage++
+			succeededWithUsage++
 		}
 
-		// Last-generation-wins: later iterations simply overwrite these,
-		// so after the loop each holds the last GENERATION's value.
+		// Last-generation-wins, over the chronologically sorted sequence:
+		// later iterations simply overwrite these, so after the loop each
+		// holds the value from the generation that genuinely ran last.
 		if g.Model != "" {
 			ev.ResponseModel = g.Model
 		}
@@ -326,10 +405,92 @@ func applyGenerations(ev *model.LLMEvent, obs []wireObservation) {
 		}
 	}
 
-	if generationsSeen > 0 && generationsWithUsage == generationsSeen {
+	ev.GenerationCount = succeeded
+	ev.ErroredGenerationCount = errored
+
+	switch {
+	case succeeded > 0:
+		ev.Status = model.StatusSuccess
+	case errored > 0:
+		ev.Status = model.StatusFailure
+	default:
+		// No GENERATION observations at all. Nothing was observed to
+		// succeed or fail, which is not the same as failing.
+		ev.Status = model.StatusUnknown
+	}
+
+	if ev.Status == model.StatusFailure {
+		// Nothing ran. Whatever zeros the source reported for usage and
+		// cost describe an absence, not a measurement -- see this
+		// function's doc comment.
+		ev.InputTokens = nil
+		ev.OutputTokens = nil
+		ev.TotalCost = nil
+		return
+	}
+
+	if succeeded > 0 && succeededWithUsage == succeeded {
 		ev.InputTokens = &inputSum
 		ev.OutputTokens = &outputSum
 	}
+}
+
+// orderedGenerations returns obs's GENERATION observations sorted oldest
+// first by startTime.
+//
+// This exists because **Langfuse's observations array is not in
+// chronological order**, which is not documented anywhere and was invisible
+// for as long as every captured trace had exactly one generation. Verified
+// on a deliberately constructed mixed trace (see
+// testdata/mixed_error_and_success.json): the generation starting at
+// 10:43:12.078 is listed *before* two that started at 10:43:11.033.
+//
+// Everything in applyGenerations that says "last wins" means last in time,
+// and said so in its comments long before it was true. Array position was
+// standing in for chronology, and it silently is not the same thing.
+//
+// Observations whose startTime is missing or unparseable sort first, in
+// their original relative order. Sorting them last would let an
+// unorderable observation win the last-wins rule over one that can be
+// placed in time -- exactly backwards. Real Langfuse data always carries
+// startTime; this is the degradation path, and it keeps a fixture with no
+// timestamps at all resolving by array order, as it did before.
+func orderedGenerations(obs []wireObservation) []wireObservation {
+	type timed struct {
+		obs     wireObservation
+		at      time.Time
+		ordered bool
+	}
+
+	gens := make([]timed, 0, len(obs))
+	for _, o := range obs {
+		if o.Type != "GENERATION" {
+			continue
+		}
+		t := timed{obs: o}
+		if o.StartTime != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, o.StartTime); err == nil {
+				t.at, t.ordered = parsed, true
+			}
+		}
+		gens = append(gens, t)
+	}
+
+	sort.SliceStable(gens, func(i, j int) bool {
+		if gens[i].ordered != gens[j].ordered {
+			return !gens[i].ordered // unorderable first
+		}
+		if !gens[i].ordered {
+			return false // both unorderable: SliceStable keeps array order
+		}
+		return gens[i].at.Before(gens[j].at)
+	})
+
+	out := make([]wireObservation, len(gens))
+	for i, g := range gens {
+		out[i] = g.obs
+	}
+	return out
 }
 
 // decodeObservations handles the polymorphism of Langfuse's "observations"

@@ -294,3 +294,62 @@ func TestBuildReference(t *testing.T) {
 		})
 	}
 }
+
+// TestMap_BlockedRequestIsNotAFreeSuccess is the mapper-side half of the
+// blocked-request regression (see internal/parse's
+// TestParseLine_BlockedRequest_UsageAndCostAbsentNotZero). The fixture is a
+// real archived Langfuse response for a request LiteLLM refused on budget.
+//
+// The failure this guards against is not a crash or an empty document: it
+// is a fully-populated, entirely plausible document that says a request
+// succeeded, used zero tokens, and cost zero dollars -- which is what a
+// free, successful request also looks like. Every assertion below is about
+// telling those two apart.
+func TestMap_BlockedRequestIsNotAFreeSuccess(t *testing.T) {
+	_, doc := mapFixture(t, "blocked")
+
+	if doc.Event.Outcome != "failure" {
+		t.Errorf("event.outcome = %q, want %q", doc.Event.Outcome, "failure")
+	}
+	if doc.Error == nil || !strings.Contains(doc.Error.Message, "Budget has been exceeded") {
+		t.Errorf("error.message = %v, want LiteLLM's enforcement text", doc.Error)
+	}
+	if doc.LLM.ErroredGenerationCount == 0 {
+		t.Error("llm.errored_generation_count = 0, want > 0")
+	}
+
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshaling document: %v", err)
+	}
+	// The zeros Langfuse reported must not appear anywhere as measurements.
+	for _, forbidden := range []string{
+		`"usage"`, `"input_tokens"`, `"output_tokens"`, `"total_cost_usd"`,
+	} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Errorf("document JSON contains %s for a request that never ran -- absent, not zero: %s", forbidden, raw)
+		}
+	}
+	// No model answered, so no answering model may be claimed.
+	if doc.GenAI != nil && doc.GenAI.Response != nil {
+		t.Errorf("gen_ai.response = %+v, want nil -- nothing responded", doc.GenAI.Response)
+	}
+	// The requested model IS known and should still be reported.
+	if doc.GenAI == nil || doc.GenAI.Request == nil || doc.GenAI.Request.Model == "" {
+		t.Error("gen_ai.request.model is absent, want the model the caller asked for")
+	}
+}
+
+// TestMap_SuccessfulRequestCarriesNoErrorObject confirms the error.* object
+// is genuinely absent on a normal request, so a detection querying for the
+// existence of error.message doesn't match every document ever indexed.
+func TestMap_SuccessfulRequestCarriesNoErrorObject(t *testing.T) {
+	_, doc := mapFixture(t, "benign")
+	if doc.Error != nil {
+		t.Errorf("Error = %+v, want nil on a successful request", doc.Error)
+	}
+	raw, _ := json.Marshal(doc)
+	if bytes.Contains(raw, []byte(`"error"`)) {
+		t.Errorf("document JSON contains an error object on a successful request: %s", raw)
+	}
+}

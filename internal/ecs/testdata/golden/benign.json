@@ -10,6 +10,7 @@
     ],
     "dataset": "wiretap.langfuse",
     "module": "wiretap",
+    "outcome": "success",
     "duration": 842000000,
     "ingested": "2026-07-28T13:53:50.623Z",
     "reference": "https://langfuse.example.local/project/clxyzproj123/traces/benign-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
@@ -45,6 +46,7 @@
     "message_count": 2,
     "output_length": 135,
     "generation_count": 1,
+    "errored_generation_count": 0,
     "total_cost_usd": 0.000123
   },
   "labels": {

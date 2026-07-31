@@ -157,9 +157,25 @@ func indexMapping() map[string]any {
 					"category":  keyword,
 					"dataset":   keyword,
 					"module":    keyword,
+					"outcome":   keyword,
 					"duration":  long,
 					"ingested":  date,
 					"reference": keyword,
+				},
+			},
+			// error.message uses "match_only_text", the type ECS itself
+			// declares for this field. It is a space-efficient variant of
+			// "text" for log-style messages that are read and
+			// full-text-searched but never scored or phrase-position
+			// queried -- which is exactly how an enforcement message like
+			// "Budget has been exceeded! Key=bob (sk-...9SfA)" gets used.
+			// Deliberately NOT wildcard: unlike llm.output, no detection
+			// greps this for a mid-string exact substring; grouping and
+			// counting happen on the gateway plane's structured
+			// error.type/error.code instead.
+			"error": map[string]any{
+				"properties": map[string]any{
+					"message": map[string]any{"type": "match_only_text"},
 				},
 			},
 			"trace":   map[string]any{"properties": map[string]any{"id": keyword}},
@@ -213,6 +229,13 @@ func indexMapping() map[string]any {
 					// counter -- integer, same reasoning as message_count/
 					// output_length above.
 					"generation_count": integer,
+					// errored_generation_count: how many of those
+					// generations the source reported at ERROR level, i.e.
+					// how many times the proxy refused this request. The
+					// field a "was this blocked" query keys on from the
+					// content plane, until the gateway plane's structured
+					// error.type supersedes it.
+					"errored_generation_count": integer,
 				},
 			},
 			"labels": map[string]any{

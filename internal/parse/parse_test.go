@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -350,5 +351,207 @@ func TestParseLine_TagsPassThrough(t *testing.T) {
 		if ev.Tags[i] != want[i] {
 			t.Errorf("Tags[%d] = %q, want %q", i, ev.Tags[i], want[i])
 		}
+	}
+}
+
+// TestParseLine_BlockedRequest_UsageAndCostAbsentNotZero is the regression
+// guard for a real defect found on live data: a request LiteLLM refused
+// (budget block, auth failure) reaches Langfuse via config.yaml's
+// failure_callback as a trace whose GENERATION observations are all
+// level "ERROR", carrying usage {input:0, output:0} and
+// calculatedTotalCost 0. Taken literally -- which is what this parser used
+// to do -- that indexes a blocked request as "a request that ran, used no
+// tokens, and cost nothing", i.e. indistinguishable from a free success.
+// Valid fields, plausible values, wrong answer.
+//
+// Both fixtures are real archived API responses (trace IDs preserved),
+// with LiteLLM's 64-hex virtual-key token hashes replaced by obvious
+// fakes. Nothing else was edited.
+func TestParseLine_BlockedRequest_UsageAndCostAbsentNotZero(t *testing.T) {
+	for _, tc := range []struct {
+		fixture     string
+		traceID     string
+		wantMessage string
+	}{
+		{"blocked_budget.json", "probe-blocked-524a9bd6fb08113e", "Budget has been exceeded!"},
+		{"blocked_auth.json", "probe-authfail-b469cbc39f389eea", "Authentication Error"},
+	} {
+		t.Run(tc.fixture, func(t *testing.T) {
+			ev, err := ParseLine(readFixture(t, tc.fixture), 1)
+			if err != nil {
+				t.Fatalf("ParseLine: %v", err)
+			}
+			if ev.TraceID != tc.traceID {
+				t.Fatalf("TraceID = %q, want %q -- wrong fixture?", ev.TraceID, tc.traceID)
+			}
+
+			if ev.Status != model.StatusFailure {
+				t.Errorf("Status = %q, want %q", ev.Status, model.StatusFailure)
+			}
+			if !strings.Contains(ev.StatusMessage, tc.wantMessage) {
+				t.Errorf("StatusMessage = %q, want it to contain %q", ev.StatusMessage, tc.wantMessage)
+			}
+
+			// The heart of it: Langfuse really did report zeros here.
+			// They must not survive as measurements.
+			if ev.InputTokens != nil {
+				t.Errorf("InputTokens = %d, want nil -- nothing ran, so the source's reported 0 is an absence, not a token count", *ev.InputTokens)
+			}
+			if ev.OutputTokens != nil {
+				t.Errorf("OutputTokens = %d, want nil, same reason", *ev.OutputTokens)
+			}
+			if ev.TotalCost != nil {
+				t.Errorf("TotalCost = %v, want nil -- a blocked request has no cost, and reporting $0 makes it look free rather than refused", *ev.TotalCost)
+			}
+
+			// Nothing answered, so there is no answering model. What
+			// LiteLLM puts on an ERROR observation is the requested one.
+			if ev.ResponseModel != "" {
+				t.Errorf("ResponseModel = %q, want empty -- no model served a request that was refused", ev.ResponseModel)
+			}
+			if ev.RequestModel == "" {
+				t.Error("RequestModel is empty, want the model the caller asked for")
+			}
+			if ev.ResponseID != "" {
+				t.Errorf("ResponseID = %q, want empty -- there is no completion", ev.ResponseID)
+			}
+
+			if ev.ErroredGenerationCount == 0 {
+				t.Error("ErroredGenerationCount = 0, want > 0 -- the enforcement records are the evidence, and must not be silently dropped")
+			}
+		})
+	}
+}
+
+// TestParseLine_MixedErrorAndSuccess_SucceedsAndKeepsTheAnsweringModel
+// covers the shape a retry produces when an early attempt is refused and a
+// later one goes through: one DEFAULT generation alongside ERROR ones. The
+// request as a whole did get an answer, so Status is success and the real
+// usage survives -- but the refusals are still counted, and crucially the
+// answering model is the DEFAULT observation's, not an ERROR observation's.
+//
+// That last point is not hypothetical. Langfuse returns observations in
+// non-chronological order (verified on this exact fixture: the DEFAULT
+// generation starts at 10:43:12.078, both ERROR ones at 10:43:11.033, yet
+// DEFAULT is first in the array), so "last generation wins" was picking an
+// arbitrary element. On this trace it picked an ERROR one and reported the
+// unprefixed requested model as the model that answered.
+func TestParseLine_MixedErrorAndSuccess_SucceedsAndKeepsTheAnsweringModel(t *testing.T) {
+	ev, err := ParseLine(readFixture(t, "mixed_error_and_success.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseLine: %v", err)
+	}
+
+	if ev.Status != model.StatusSuccess {
+		t.Errorf("Status = %q, want %q -- one generation did answer", ev.Status, model.StatusSuccess)
+	}
+	if ev.ErroredGenerationCount != 2 {
+		t.Errorf("ErroredGenerationCount = %d, want 2", ev.ErroredGenerationCount)
+	}
+	if ev.ResponseModel != "groq/llama-3.3-70b-versatile" {
+		t.Errorf("ResponseModel = %q, want %q -- the ERROR observations' unprefixed requested model must not overwrite the model that actually answered", ev.ResponseModel, "groq/llama-3.3-70b-versatile")
+	}
+	if ev.ResponseID != "chatcmpl-ea6b8c71-42ed-479d-8bc1-71cdd0d4146c" {
+		t.Errorf("ResponseID = %q, want the successful generation's completion ID", ev.ResponseID)
+	}
+	if ev.InputTokens == nil || *ev.InputTokens != 37 {
+		t.Errorf("InputTokens = %v, want 37 (the successful generation's real usage)", ev.InputTokens)
+	}
+	if ev.TotalCost == nil {
+		t.Fatal("TotalCost = nil, want the real cost -- something did run")
+	}
+}
+
+// TestParseLine_TwoSuccesses_ResolveByTimeNotArrayPosition is the guard for
+// the ordering assumption "last generation wins" quietly depended on.
+//
+// Langfuse's observations array is not chronologically ordered. That went
+// unnoticed because every real captured trace had exactly one generation,
+// so array position and chronology could not disagree. The ERROR/non-ERROR
+// split fixed the specific mixed-trace symptom but not the underlying
+// assumption: two *successful* generations would still resolve by array
+// position.
+//
+// This fixture lists the chronologically LATER generation (model-second,
+// 10:43:20) FIRST in the array, and the earlier one (model-first,
+// 10:43:12) second -- the exact shape observed on real data. Resolving by
+// array position reports model-first; resolving by time reports
+// model-second, which is correct.
+func TestParseLine_TwoSuccesses_ResolveByTimeNotArrayPosition(t *testing.T) {
+	ev, err := ParseLine(readFixture(t, "two_successes_out_of_order.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseLine: %v", err)
+	}
+
+	if ev.GenerationCount != 2 {
+		t.Errorf("GenerationCount = %d, want 2", ev.GenerationCount)
+	}
+	// Summed fields are order-independent -- they must be right either way,
+	// and are asserted here so a sort bug can't hide behind them.
+	if ev.InputTokens == nil || *ev.InputTokens != 30 { // 10+20
+		t.Errorf("InputTokens = %v, want 30", ev.InputTokens)
+	}
+	if ev.OutputTokens == nil || *ev.OutputTokens != 12 { // 5+7
+		t.Errorf("OutputTokens = %v, want 12", ev.OutputTokens)
+	}
+
+	// Single-valued fields are where order actually decides the answer.
+	if ev.ResponseModel != "groq/model-second" {
+		t.Errorf("ResponseModel = %q, want %q -- the chronologically last generation, not the first array element", ev.ResponseModel, "groq/model-second")
+	}
+	if ev.RequestModel != "model-second" {
+		t.Errorf("RequestModel = %q, want %q", ev.RequestModel, "model-second")
+	}
+	if ev.MaxTokens == nil || *ev.MaxTokens != 200 {
+		t.Errorf("MaxTokens = %v, want 200 (the chronologically last generation's)", ev.MaxTokens)
+	}
+	if ev.ResponseID != "chatcmpl-22222222-2222-2222-2222-222222222222" {
+		t.Errorf("ResponseID = %q, want the chronologically last generation's completion ID", ev.ResponseID)
+	}
+}
+
+// TestParseLine_NoStartTimes_FallsBackToArrayOrder pins the degradation
+// path. three_generations.json carries no startTime on any observation --
+// nothing can be ordered in time, so array order is all there is, and the
+// pre-sort behaviour must be preserved exactly rather than scrambled.
+func TestParseLine_NoStartTimes_FallsBackToArrayOrder(t *testing.T) {
+	ev, err := ParseLine(readFixture(t, "three_generations.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseLine: %v", err)
+	}
+	if ev.ResponseModel != "groq/model-c" {
+		t.Errorf("ResponseModel = %q, want groq/model-c (last array element, since no observation carries a startTime)", ev.ResponseModel)
+	}
+}
+
+// TestParseLine_ErrorGenerationsExcludedFromCountAndSum verifies the two
+// reductions ERROR observations are kept out of. On a fully blocked
+// request the count is zero completions (not six error records), and on a
+// mixed trace only the generation that actually answered is counted or
+// summed.
+func TestParseLine_ErrorGenerationsExcludedFromCountAndSum(t *testing.T) {
+	blocked, err := ParseLine(readFixture(t, "blocked_budget.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseLine(blocked): %v", err)
+	}
+	if blocked.GenerationCount != 0 {
+		t.Errorf("blocked GenerationCount = %d, want 0 -- no generation answered; the refusals are counted in ErroredGenerationCount", blocked.GenerationCount)
+	}
+	if blocked.ErroredGenerationCount != 2 {
+		t.Errorf("blocked ErroredGenerationCount = %d, want 2", blocked.ErroredGenerationCount)
+	}
+
+	mixed, err := ParseLine(readFixture(t, "mixed_error_and_success.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseLine(mixed): %v", err)
+	}
+	if mixed.GenerationCount != 1 {
+		t.Errorf("mixed GenerationCount = %d, want 1 -- one generation answered, two were refused", mixed.GenerationCount)
+	}
+	if mixed.ErroredGenerationCount != 2 {
+		t.Errorf("mixed ErroredGenerationCount = %d, want 2", mixed.ErroredGenerationCount)
+	}
+	if mixed.InputTokens == nil || *mixed.InputTokens != 37 {
+		t.Errorf("mixed InputTokens = %v, want 37 (the answering generation's usage alone)", mixed.InputTokens)
 	}
 }

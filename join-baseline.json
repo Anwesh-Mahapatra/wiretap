@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Content-plane trace IDs that can NEVER be joined to a gateway record,",
+    "for a known and permanent reason: they were produced before",
+    "cmd/wiretap began sending metadata.spend_logs_metadata.trace_id, so",
+    "no gateway record for them carries the join key at all.",
+    "",
+    "This file exists so wiretapd's join-health metric can report",
+    "expected-unmatched separately from unexpected-unmatched. Pre-excusing",
+    "a fuzzy 'some unmatched is normal' baseline would hide exactly the",
+    "signal the metric is for: an unexplained unmatched trace must be",
+    "visible against a known set, not lost inside a number nobody trusts.",
+    "",
+    "This list is closed. It will never grow: every request made after the",
+    "client change carries the join key. An unmatched trace ID that is not",
+    "in this list is an incident -- see RUNBOOK.md."
+  ],
+  "reason": "predates_spend_logs_metadata_trace_id",
+  "recorded_at": "2026-07-31T11:15:00Z",
+  "cutoff": {
+    "_comment": "Every content event at or before this instant predates the client change; every one after it must carry the join key.",
+    "timestamp": "2026-07-31T11:00:00Z"
+  },
+  "trace_ids": [
+    "benign-2b4e3d61e1c9c55acb3b3a3cebdb2a89",
+    "injection-5cadc586c2f135d18fdb6fbd170ba954",
+    "truncated-a18a7b131d2883e8b2838fde73674a55",
+    "benign-1c6a5ab70c3db7833233b5df6039d5e6",
+    "injection-463ae362b9c6a92a5c26f986fd74406e",
+    "truncated-15c5be0b826a676cb973a917d8bb3f5b"
+  ],
+  "detail": [
+    {
+      "trace_id": "benign-2b4e3d61e1c9c55acb3b3a3cebdb2a89",
+      "timestamp": "2026-07-30T11:01:18.096Z"
+    },
+    {
+      "trace_id": "injection-5cadc586c2f135d18fdb6fbd170ba954",
+      "timestamp": "2026-07-30T11:01:18.405Z"
+    },
+    {
+      "trace_id": "truncated-a18a7b131d2883e8b2838fde73674a55",
+      "timestamp": "2026-07-30T11:01:18.607Z"
+    },
+    {
+      "trace_id": "benign-1c6a5ab70c3db7833233b5df6039d5e6",
+      "timestamp": "2026-07-30T23:05:07.132Z"
+    },
+    {
+      "trace_id": "injection-463ae362b9c6a92a5c26f986fd74406e",
+      "timestamp": "2026-07-30T23:05:08.447Z"
+    },
+    {
+      "trace_id": "truncated-15c5be0b826a676cb973a917d8bb3f5b",
+      "timestamp": "2026-07-30T23:05:09.827Z"
+    }
+  ]
+}

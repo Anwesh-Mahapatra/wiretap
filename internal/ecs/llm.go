@@ -42,6 +42,15 @@ type llm struct {
 	// no indication it was a sum would misleadingly read as one call's
 	// cost.
 	GenerationCount int `json:"generation_count"`
+	// ErroredGenerationCount is how many of those generations the source
+	// reported at ERROR level -- for this deployment, how many times
+	// LiteLLM refused the request (budget block, auth failure) rather than
+	// forwarding it. Always present, never omitted: a real, present 0 on
+	// every successful request is what makes "> 0" a usable query, whereas
+	// an omitted field would force every detection to reason about
+	// missingness. Not an ECS field; ECS has no notion of "how many times
+	// was this one logical request rejected."
+	ErroredGenerationCount int `json:"errored_generation_count"`
 	// TotalCostUSD is another ECS gap, not a content field: the Gen AI
 	// field group (docs/reference/ecs-gen_ai.md) has no cost field at all.
 	// Pointer, not a plain float64, because a genuinely-unreported cost
