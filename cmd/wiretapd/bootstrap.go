@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"time"
+
+	"wiretap/internal/esink"
 )
 
 func cmdBootstrap(args []string) error {
@@ -23,11 +25,22 @@ func cmdBootstrap(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	bcfg := cfg.bootstrapConfig()
-	if err := cfg.esClient().Bootstrap(ctx, bcfg); err != nil {
+	// Both datasets, every run. Idempotent: PUTting the same template
+	// twice is a plain overwrite, and index creation is skipped when the
+	// index already exists -- so this is safe to run on every deploy and
+	// is how a new gateway index gets created on an existing stack.
+	cfgs := cfg.bootstrapConfigs()
+	if err := cfg.esClient().BootstrapAll(ctx, cfgs); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
 
-	logger.Info("bootstrap complete", "index_base", bcfg.IndexBase, "template", bcfg.TemplateName())
+	for _, bcfg := range cfgs {
+		logger.Info("bootstrap complete",
+			"dataset", bcfg.Dataset.String(),
+			"index_base", bcfg.IndexBase,
+			"template", bcfg.TemplateName(),
+		)
+	}
+	logger.Info("shared index pattern for cross-plane queries", "pattern", esink.SharedIndexPattern)
 	return nil
 }

@@ -428,3 +428,26 @@ func TestParseGatewayLine_MissingJoinKeyIsAbsentNotInvented(t *testing.T) {
 		t.Errorf("TraceID = %q, want empty -- no join key was sent, and inventing one from session_id or call_id would fabricate correlations", ev.TraceID)
 	}
 }
+
+// TestParseGatewayLine_NullTraceIDValueIsAbsent covers the nested form of
+// the null trap. spend_logs_metadata is map[string]json.RawMessage, so a
+// null *value* under the trace_id key yields the four bytes "null" rather
+// than a missing entry -- the key is present, the RawMessage is non-nil,
+// and only unmarshalling it reveals there is nothing there. Unmarshalling
+// "null" into a string succeeds and leaves "", so the empty-string guard
+// in traceID is what actually stops an empty join key getting through.
+func TestParseGatewayLine_NullTraceIDValueIsAbsent(t *testing.T) {
+	for _, raw := range []string{
+		`{"request_id":"r1","metadata":{"spend_logs_metadata":{"trace_id":null}}}`,
+		`{"request_id":"r1","metadata":{"spend_logs_metadata":{"trace_id":""}}}`,
+		`{"request_id":"r1","metadata":{"spend_logs_metadata":{}}}`,
+	} {
+		ev, err := ParseGatewayLine([]byte(raw), 1)
+		if err != nil {
+			t.Fatalf("ParseGatewayLine(%s): %v", raw, err)
+		}
+		if ev.TraceID != "" {
+			t.Errorf("TraceID = %q for %s, want empty -- an empty join key must never read as a valid one", ev.TraceID, raw)
+		}
+	}
+}

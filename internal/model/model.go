@@ -208,6 +208,37 @@ type LLMEvent struct {
 	SourceRecord []byte // the original raw record this event was parsed from (e.g. one NDJSON line), kept for debugging and replay
 }
 
+// DocumentID is the stable identifier this event should be indexed under,
+// and it is what makes `wiretapd backfill` safe to run as many times as
+// you like: re-indexing the same event overwrites one document instead of
+// creating a duplicate.
+//
+// The two planes need DIFFERENT rules, and getting this wrong is a data-
+// loss bug rather than a cosmetic one:
+//
+//   - Content plane: the trace ID. One Langfuse trace is one logical
+//     request, and one document.
+//   - Gateway plane: the gateway's own per-attempt request ID. A spend
+//     record is one HTTP *attempt*, and a client that retried three times
+//     produces three records sharing one trace ID. Keying those on trace
+//     ID would make each attempt overwrite the last, collapsing three
+//     enforcement events into one and silently destroying exactly the
+//     retry-inflation evidence docs/DETECTIONS.md depends on. RequestID is
+//     the primary key of LiteLLM_SpendLogs, so it is unique by
+//     construction.
+//
+// Returns "" when the event carries no usable identifier, which a caller
+// must treat as "do not index" rather than letting Elasticsearch
+// auto-generate an ID -- an auto-generated ID is a new document on every
+// replay, which is the duplicate-on-backfill failure this method exists to
+// prevent.
+func (e *LLMEvent) DocumentID() string {
+	if e.Gateway != nil {
+		return e.Gateway.RequestID
+	}
+	return e.TraceID
+}
+
 // GatewayDetail is what a *gateway* knows about a request that a content
 // tracer structurally cannot: which credential paid, what HTTP status the
 // caller received, and -- when the request was refused -- the machine-

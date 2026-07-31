@@ -307,8 +307,26 @@ services:
       LANGFUSE_PUBLIC_URL: http://localhost:3000
       # Kept in a separate volume from the archive -- see the /state
       # volume comment below.
+      LITELLM_BASE_URL: http://litellm:4000
+      # Four checkpoints, not two. The fetch/index split exists so an
+      # Elasticsearch outage cannot cause permanent data loss (see
+      # arch.md); that reasoning applies per source, so each source gets
+      # its own pair. Every path here is distinct from every other -- two
+      # writers on one file is the duplicate-writer race that removing
+      # tracepump solved, and wiretapd refuses to start if any two of
+      # these collide.
       WIRETAPD_INDEX_STATE: /state/wiretapd-index-state.json
       WIRETAPD_FETCH_STATE: /state/wiretapd-fetch-state.json
+      WIRETAPD_GATEWAY_INDEX_STATE: /state/wiretapd-gateway-index-state.json
+      WIRETAPD_GATEWAY_FETCH_STATE: /state/wiretapd-gateway-fetch-state.json
+      # One archive per source. Each has exactly one writer.
+      WIRETAPD_GATEWAY_ARCHIVE: /data/litellm-spend.ndjson
+      # One dead-letter file per source: DeadLetterRecord carries no
+      # dataset field, so a shared file could not be replayed into the
+      # right index.
+      WIRETAPD_DEAD_LETTER: /state/dead-letter.json
+      WIRETAPD_GATEWAY_DEAD_LETTER: /state/dead-letter-gateway.json
+      WIRETAPD_JOIN_BASELINE: /app/join-baseline.json
     volumes:
       # Read-write: wiretapd is this stack's only fetcher, so it's the one
       # writing the archive now, not just reading it.

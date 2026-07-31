@@ -1,0 +1,64 @@
+{
+  "@timestamp": "2026-07-31T11:12:06.163Z",
+  "ecs": {
+    "version": "9.4.0"
+  },
+  "event": {
+    "kind": "event",
+    "category": [
+      "api"
+    ],
+    "type": [
+      "allowed"
+    ],
+    "action": "chat_completion",
+    "dataset": "wiretap.litellm",
+    "module": "wiretap",
+    "outcome": "success",
+    "start": "2026-07-31T11:12:06.163Z",
+    "end": "2026-07-31T11:12:06.982Z",
+    "duration": 818000000
+  },
+  "trace": {
+    "id": "benign-d04b73554231370f4f15c9293bfdbae3"
+  },
+  "session": {
+    "id": "module4"
+  },
+  "user": {
+    "id": "default_user_id"
+  },
+  "gen_ai": {
+    "operation": {
+      "name": "chat"
+    },
+    "system": "groq",
+    "request": {
+      "model": "llama-3.3-70b-versatile"
+    },
+    "response": {
+      "model": "groq/llama-3.3-70b-versatile",
+      "id": "chatcmpl-eef53a08-b44b-4d17-865d-dc514bfaa93f"
+    },
+    "usage": {
+      "input_tokens": 66,
+      "output_tokens": 149
+    }
+  },
+  "llm": {
+    "total_cost_usd": 0.00015665,
+    "key": {
+      "hash": "litellm_proxy_master_key"
+    }
+  },
+  "labels": {},
+  "related": {
+    "user": [
+      "default_user_id"
+    ]
+  },
+  "tags": [
+    "wiretap",
+    "benign"
+  ]
+}

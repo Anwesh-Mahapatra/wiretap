@@ -44,7 +44,6 @@
 package parse
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -152,7 +151,16 @@ type wireObservation struct {
 	// StartTime is when this generation began, and it is the ONLY
 	// trustworthy way to order a trace's observations. Langfuse does not
 	// return them in chronological order -- see orderedGenerations.
+	//
+	// It is also the content plane's only accurate record of when the
+	// request actually started: the trace-level timestamp is when
+	// LiteLLM's callback fired, which is after the response on a success.
+	// Measured against the gateway's own startTime for the same request,
+	// observation startTime agrees to the millisecond -- both come from
+	// the same process watching the same request -- which is what makes
+	// event.start comparable across planes. See docs/CORRELATION.md §5.
 	StartTime       string                     `json:"startTime"`
+	EndTime         string                     `json:"endTime"`
 	Usage           *wireUsage                 `json:"usage"`
 	Latency         *float64                   `json:"latency"`
 	Metadata        wireObservationMetadata    `json:"metadata"`
@@ -407,6 +415,7 @@ func applyGenerations(ev *model.LLMEvent, obs []wireObservation) {
 
 	ev.GenerationCount = succeeded
 	ev.ErroredGenerationCount = errored
+	applyObservationBounds(ev, obs)
 
 	switch {
 	case succeeded > 0:
@@ -433,6 +442,50 @@ func applyGenerations(ev *model.LLMEvent, obs []wireObservation) {
 		ev.InputTokens = &inputSum
 		ev.OutputTokens = &outputSum
 	}
+}
+
+// applyObservationBounds sets ev.StartTime and ev.EndTime from the widest
+// span the trace's observations cover: the earliest start and the latest
+// end, across every observation including ERROR ones.
+//
+// ERROR observations are included here even though they are excluded from
+// counts and token sums, and the distinction is deliberate. A refused
+// attempt did not produce a generation, so it must not inflate
+// generation_count -- but it did happen, at a real instant, and it is part
+// of how long this request occupied the system. For a fully-refused trace
+// the ERROR observations are the *only* record of when anything happened,
+// so excluding them would leave event.start empty on exactly the events
+// the gateway plane exists to correlate.
+//
+// These are the content plane's contribution to cross-plane correlation.
+// The trace-level timestamp cannot serve: it records when LiteLLM's
+// callback fired, which trails the request by its full duration on a
+// success. Observation startTime matches the gateway's startTime to the
+// millisecond. See docs/CORRELATION.md §5.
+func applyObservationBounds(ev *model.LLMEvent, obs []wireObservation) {
+	for i := range obs {
+		if t := parseObservationTime(obs[i].StartTime); !t.IsZero() {
+			if ev.StartTime.IsZero() || t.Before(ev.StartTime) {
+				ev.StartTime = t
+			}
+		}
+		if t := parseObservationTime(obs[i].EndTime); !t.IsZero() {
+			if ev.EndTime.IsZero() || t.After(ev.EndTime) {
+				ev.EndTime = t
+			}
+		}
+	}
+}
+
+func parseObservationTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // orderedGenerations returns obs's GENERATION observations sorted oldest
@@ -501,8 +554,7 @@ func orderedGenerations(obs []wireObservation) []wireObservation {
 // so callers should treat token counts and the answering model as unknown
 // rather than absent-and-zero.
 func decodeObservations(raw json.RawMessage) (obs []wireObservation, full bool) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if !jsonPresent(raw) {
 		return nil, false
 	}
 	if err := json.Unmarshal(raw, &obs); err == nil {
@@ -517,8 +569,7 @@ func decodeObservations(raw json.RawMessage) (obs []wireObservation, full bool) 
 // trace's "input" field. Unrecognised shapes (or a genuinely absent input)
 // yield no messages, not an error.
 func decodeMessages(raw json.RawMessage) []model.Message {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if !jsonPresent(raw) {
 		return nil
 	}
 	var wrapped wireInputMessages
@@ -544,8 +595,7 @@ func toModelMessages(wm []wireMessage) []model.Message {
 }
 
 func decodeOutput(raw json.RawMessage) *wireOutput {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if !jsonPresent(raw) {
 		return nil
 	}
 	var out wireOutput

@@ -3,15 +3,14 @@ package ecs
 import (
 	"encoding/json"
 	"strings"
-	"time"
 
 	"wiretap/internal/model"
 )
 
-// Config carries the small amount of context Map needs beyond the event
-// itself. It exists so Map stays a pure function -- everything it needs
-// (including "what time is it") is a parameter, not something it reaches
-// out and reads for itself.
+// Config carries the small amount of context the mappers need beyond the
+// event itself. It exists so Map stays a pure function -- everything it
+// needs (including "what time is it") is a parameter, not something it
+// reaches out and reads for itself.
 type Config struct {
 	// LangfuseBaseURL is prepended to ev.SourceRef (a path like
 	// "/project/x/traces/y") to build event.reference as a full,
@@ -20,48 +19,61 @@ type Config struct {
 	// configured" -- event.reference falls back to the bare path, which is
 	// still more useful than nothing.
 	LangfuseBaseURL string
-	// GenAISystem and GenAIOperationName are this deployment's constant
-	// answers to "which Gen AI product served this" and "what kind of
-	// call was this" (see genai.go's doc comment on gen_ai.system for why
-	// "groq" is a real, spec-recognised value here, not a placeholder).
-	// They're threaded through Config rather than hardcoded in Map so a
-	// future multi-provider deployment doesn't require editing the
-	// mapper, and so golden tests can pin them explicitly.
-	GenAISystem        string
-	GenAIOperationName string
+
+	// GenAISystemFallback is what gen_ai.system falls back to when neither
+	// a gateway-reported provider nor a model-name route prefix
+	// identifies one.
+	//
+	// It used to be named GenAISystem and was used unconditionally, which
+	// meant every document claimed "groq" whether or not Groq served it --
+	// correct only while config.yaml had exactly one model_list entry, and
+	// a confident lie the day it had two. The rename is deliberate: a
+	// field called GenAISystem invites being used as the answer, and a
+	// field called GenAISystemFallback does not. See provider.go.
+	GenAISystemFallback string
+
+	// GenAIOperationFallback is used when the source reports nothing to
+	// derive an operation from. On the content plane that is always,
+	// because Langfuse types every call as a GENERATION and records no
+	// distinction between chat and embeddings; on the gateway plane it
+	// applies only to refused requests, which never got a call_type. See
+	// DefaultGenAIOperation for why a constant is defensible here and not
+	// for gen_ai.system.
+	GenAIOperationFallback string
 }
 
-// DefaultConfig returns the Config matching this project's actual, current
-// deployment (see config.yaml: LiteLLM proxies every request to Groq's
-// llama-3.3-70b-versatile). Callers that want different values (a
-// different provider, a different Langfuse base URL) build their own
-// Config instead of calling this.
+// DefaultConfig returns the Config for mapping this project's Langfuse
+// content plane. Callers wanting different values build their own Config.
 func DefaultConfig(langfuseBaseURL string) Config {
 	return Config{
-		LangfuseBaseURL:    langfuseBaseURL,
-		GenAISystem:        "groq",
-		GenAIOperationName: "chat",
+		LangfuseBaseURL:        langfuseBaseURL,
+		GenAISystemFallback:    DefaultGenAISystem,
+		GenAIOperationFallback: DefaultGenAIOperation,
 	}
 }
 
-// Map builds an ECS Document from ev. It is a pure function: no I/O, no
-// globals, no clock reads -- every value in the result traces back to
-// either ev or cfg, both supplied by the caller, which is what makes a
-// byte-stable golden-file test possible at all. event.ingested in
-// particular comes from ev.IngestTimestamp (Langfuse's own createdAt --
-// confirmed present on real captured data despite its absence from
-// Langfuse's published OpenAPI spec, see internal/parse's package doc),
-// not from "now": Map has no clock to read from, on purpose.
+// Map builds an ECS Document for the *content* plane (event.dataset
+// "wiretap.langfuse") from ev. It is a pure function: no I/O, no globals,
+// no clock reads -- every value in the result traces back to either ev or
+// cfg, both supplied by the caller, which is what makes a byte-stable
+// golden-file test possible at all. event.ingested in particular comes
+// from ev.IngestTimestamp (Langfuse's own createdAt), not from "now": Map
+// has no clock to read from, on purpose.
+//
+// Fields deliberately NOT set here, and why:
+//
+//   - event.type. Deciding a request was *denied* rather than merely
+//     failed needs the error class, and the content plane has only a
+//     sentence of English. Claiming "denied" for an upstream provider
+//     error would be an invented fact; see MapGateway, which has the
+//     structured class and can say it honestly.
+//   - http.*, error.type, error.code, llm.key.*. The content plane has no
+//     access to any of them.
 func Map(ev *model.LLMEvent, cfg Config) *Document {
-	doc := &Document{
-		ECS: ecsMeta{Version: ECSVersion},
-		Event: event{
-			Kind:     "event",
-			Category: []string{"api"},
-			Dataset:  "wiretap.langfuse",
-			Module:   "wiretap",
-		},
-		LLM: llm{
+	doc := newDocument(ev, DatasetLangfuse)
+
+	doc.LLM = llm{
+		llmContent: &llmContent{
 			SystemPrompt:           lastMessageContent(ev.Messages, "system"),
 			UserPrompt:             lastMessageContent(ev.Messages, "user"),
 			Output:                 ev.OutputContent,
@@ -69,47 +81,17 @@ func Map(ev *model.LLMEvent, cfg Config) *Document {
 			Messages:               encodeMessages(ev.Messages),
 			MessageCount:           len(ev.Messages),
 			OutputLength:           len(ev.OutputContent),
-			TotalCostUSD:           ev.TotalCost,
 			GenerationCount:        ev.GenerationCount,
 			ErroredGenerationCount: ev.ErroredGenerationCount,
 		},
-		Labels: labels{
-			WiretapOutcome:  string(ev.Outcome),
-			WiretapScenario: ev.TraceName,
-		},
-		Tags: ev.Tags,
+		TotalCostUSD: ev.TotalCost,
 	}
 
-	// model.Status's constants are exactly ECS event.outcome's allowed
-	// values, so this is an assignment, not a mapping. StatusUnknown is
-	// the empty string and omitempty drops it -- see event.Outcome's doc.
-	doc.Event.Outcome = string(ev.Status)
-	if ev.StatusMessage != "" {
-		doc.Error = &ecsError{Message: ev.StatusMessage}
-	}
-
-	if !ev.RequestTimestamp.IsZero() {
-		doc.Timestamp = ev.RequestTimestamp.UTC().Format(time.RFC3339Nano)
-	}
-	if !ev.IngestTimestamp.IsZero() {
-		doc.Event.Ingested = ev.IngestTimestamp.UTC().Format(time.RFC3339Nano)
-	}
-	if ev.Duration != nil {
-		ns := ev.Duration.Nanoseconds()
-		doc.Event.Duration = &ns
-	}
 	if ev.SourceRef != "" {
 		doc.Event.Reference = buildReference(cfg.LangfuseBaseURL, ev.SourceRef)
 	}
-
-	if ev.TraceID != "" {
-		doc.Trace = &idField{ID: ev.TraceID}
-	}
-	if ev.SessionID != "" {
-		doc.Session = &idField{ID: ev.SessionID}
-	}
 	if ev.UserID != "" {
-		doc.User = &idField{ID: ev.UserID}
+		doc.Related = &related{User: []string{ev.UserID}}
 	}
 
 	doc.GenAI = buildGenAI(ev, cfg)
@@ -118,9 +100,20 @@ func Map(ev *model.LLMEvent, cfg Config) *Document {
 }
 
 func buildGenAI(ev *model.LLMEvent, cfg Config) *genAI {
-	g := &genAI{System: cfg.GenAISystem}
-	if cfg.GenAIOperationName != "" {
-		g.Operation = &genAIOperation{Name: cfg.GenAIOperationName}
+	// Provider is derived from the best evidence on the event, falling
+	// back to the configured constant only when nothing identifies one.
+	// The gateway's own provider field is preferred over a model-name
+	// prefix; both are preferred over the fallback. See provider.go.
+	var gatewayProvider, callType string
+	if ev.Gateway != nil {
+		gatewayProvider = ev.Gateway.Provider
+		callType = ev.Gateway.CallType
+	}
+	system, _ := deriveGenAISystem(gatewayProvider, ev.ResponseModel, ev.RequestModel, cfg.GenAISystemFallback)
+
+	g := &genAI{System: system}
+	if op := deriveOperation(callType, cfg.GenAIOperationFallback); op != "" {
+		g.Operation = &genAIOperation{Name: op}
 	}
 	if ev.RequestModel != "" || ev.MaxTokens != nil {
 		g.Request = &genAIRequest{Model: ev.RequestModel, MaxTokens: ev.MaxTokens}

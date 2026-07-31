@@ -17,4 +17,10 @@ ENTRYPOINT ["/tracepump"]
 
 FROM gcr.io/distroless/static-debian12:nonroot AS wiretapd
 COPY --from=build /out/wiretapd /wiretapd
+# join-baseline.json enumerates the trace IDs that can never be joined,
+# because they predate the client sending the join key. The join-health
+# metric needs it to report expected-unmatched separately from
+# unexplained-unmatched -- without it every report carries a constant
+# remainder that trains readers to ignore the number.
+COPY --from=build /src/join-baseline.json /app/join-baseline.json
 ENTRYPOINT ["/wiretapd"]

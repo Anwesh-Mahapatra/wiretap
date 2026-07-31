@@ -6,6 +6,7 @@ package esink
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -103,4 +104,20 @@ func (c *Client) do(ctx context.Context, method, path, contentType string, body 
 		return respBody, nil
 	}
 	return respBody, classifyStatus(resp.StatusCode, resp.Status, respBody, resp.Header)
+}
+
+// Search runs a search against index (which may be an alias or a pattern)
+// and returns the raw response body. Exists so callers that need to *read*
+// from Elasticsearch -- the join-health metric, notably -- do not each
+// reimplement request plumbing, auth, and error classification.
+func (c *Client) Search(ctx context.Context, index string, body any) (json.RawMessage, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encoding search body: %w", err)
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/"+index+"/_search", "application/json", encoded)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(resp), nil
 }

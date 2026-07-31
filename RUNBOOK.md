@@ -96,7 +96,7 @@ by default) logging `"msg":"index pass ok"` with counts of how many
 archive lines it read, parsed, and queued for Elasticsearch. Errors from
 either cycle are logged, not silent.
 
-## 4. Bootstrap the Elasticsearch index
+## 4. Bootstrap the Elasticsearch indices
 
 Elasticsearch needs to be told, in advance, the shape of the data it's
 about to receive (which fields exist, and what type each one is) -- this
@@ -109,7 +109,47 @@ go run ./cmd/wiretapd bootstrap
 ```
 
 Safe to run more than once -- it's a plain overwrite of the same
-definition, not an error, if the index already exists.
+definition, not an error, if an index already exists.
+
+### There are two indices, not one
+
+wiretap ingests two log sources and keeps them in **separate indices**
+behind a **shared pattern**:
+
+| | Index | `event.dataset` | What it holds |
+|---|---|---|---|
+| Content plane | `wiretap-llm-events-*` | `wiretap.langfuse` | Prompts, responses, token counts |
+| Gateway plane | `wiretap-llm-gateway-*` | `wiretap.litellm` | Virtual key identity, HTTP status, error class |
+| **Both** | **`wiretap-llm-*`** | — | What a Kibana data view and any cross-plane query points at |
+
+`bootstrap` creates both, every run. Expected output:
+
+```
+{"msg":"bootstrap complete","dataset":"content","index_base":"wiretap-llm-events", ...}
+{"msg":"bootstrap complete","dataset":"gateway","index_base":"wiretap-llm-gateway", ...}
+{"msg":"shared index pattern for cross-plane queries","pattern":"wiretap-llm-*"}
+```
+
+Confirm both exist:
+
+```bash
+source .env
+curl -s -u "elastic:$ELASTIC_PASSWORD" "http://localhost:9200/_cat/indices/wiretap-llm-*?v"
+```
+
+**Why two indices rather than one.** The two datasets have genuinely
+different shapes -- the gateway has no prompt text, ever -- and mixing
+them would mean every gateway document carrying empty content fields.
+That is not merely untidy: a detection with a negative clause like
+`NOT llm.output: *` would silently start matching every gateway document.
+Separate indices, one shared pattern, told apart by `event.dataset`. See
+`docs/CORRELATION.md` §3 for the full reasoning, and `notes.md` for the
+incident that made the point concrete.
+
+**When you add a Kibana data view, point it at `wiretap-llm-*`,** not at
+either index individually. An EQL sequence query -- which is what the
+cross-plane detections in `docs/DETECTIONS.md` need -- cannot span two
+data views.
 
 ## 5. Generate some test data and confirm it flows through
 
@@ -143,33 +183,78 @@ common way to conclude this pipeline is broken when it isn't.
 There are two ways out. For this lab, the first is almost always the right
 one -- it's exactly why the NDJSON archive exists (see `arch.md`):
 
+### Do I need to recreate anything? A decision table
+
+| What changed | Content index | Gateway index |
+|---|---|---|
+| A field added to the **shared** mapping (`event.*`, `gen_ai.*`, `error.*`, `trace.id`, `related.*`) | **Recreate** | **Recreate** |
+| A field added to `llm.*` content fields only | **Recreate** | No |
+| A field added to `llm.key.*` or `http.*` | No | **Recreate** |
+| A field's *type* changed anywhere | **Recreate whichever index maps it** | same |
+| Only mapper *logic* changed (a value derived differently, no new field) | No recreation — just `backfill` | same |
+
+If unsure, recreating both is always safe. The archive is the source of
+truth and replaying it is cheap.
+
 ### Recreate the index and replay the archive (recommended)
+
+**Stop `wiretapd` first.** Deleting an index out from under a running
+indexer produces confusing partial failures in its logs; it recovers, but
+you will waste time reading them.
 
 ```bash
 source .env
+docker compose stop wiretapd
 
-# 1. Delete the old, wrongly-mapped concrete index. (The alias
-#    wiretap-llm-events briefly points at nothing -- fine for a lab; don't
-#    do this against something else actively querying it at the same time.)
+# 1. Delete the old, wrongly-mapped concrete index/indices. The alias
+#    briefly points at nothing -- fine for a lab; don't do this against
+#    something else actively querying it at the same time.
+#    Delete only the plane(s) the table above says need it.
 curl -s -u "elastic:$ELASTIC_PASSWORD" -X DELETE http://localhost:9200/wiretap-llm-events-000001
+curl -s -u "elastic:$ELASTIC_PASSWORD" -X DELETE http://localhost:9200/wiretap-llm-gateway-000001
 
-# 2. Recreate it from the (already-updated) template. Bootstrap skips
-#    creating the index if one already exists -- step 1 is what makes this
-#    actually create a fresh one instead of silently doing nothing.
-go run ./cmd/wiretapd bootstrap   # or: docker compose run --rm wiretapd bootstrap
+# 2. Recreate from the (already-updated) templates. Bootstrap creates BOTH
+#    datasets and skips any index that already exists -- step 1 is what
+#    makes this actually create fresh ones instead of silently doing
+#    nothing.
+docker compose run --rm wiretapd bootstrap
 
-# 3. Replay the entire archive through the corrected mapping. This is not
-#    a re-fetch from Langfuse -- the archive already has everything;
-#    backfill just re-reads and re-indexes it. Safe to run any time,
-#    because indexing is _id-keyed (see arch.md): nothing is duplicated.
-go run ./cmd/wiretapd backfill   # or: docker compose run --rm wiretapd backfill
+# 3. Replay both archives through the corrected mappings. This is not a
+#    re-fetch from the source APIs -- the archives already have
+#    everything. Safe to run any time: indexing is _id-keyed, so nothing
+#    is duplicated (see below).
+docker compose run --rm wiretapd backfill
+
+docker compose up -d wiretapd
 ```
 
-Confirm the new mapping actually took effect:
+Confirm the new mappings actually took effect, and that document counts
+came back to what they were:
 
 ```bash
-curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200/wiretap-llm-events/_mapping | python3 -m json.tool
+curl -s -u "elastic:$ELASTIC_PASSWORD" "http://localhost:9200/wiretap-llm-events/_mapping" | python3 -m json.tool
+curl -s -u "elastic:$ELASTIC_PASSWORD" "http://localhost:9200/_cat/indices/wiretap-llm-*?v&h=index,docs.count"
 ```
+
+### Why replay never duplicates, and the one way it could
+
+Every document is indexed under an explicit `_id`, so re-indexing the same
+record overwrites one document rather than adding a second. The two planes
+use **different** rules for that ID, and the difference matters:
+
+- **Content plane:** `_id` = the trace ID. One trace, one logical request,
+  one document.
+- **Gateway plane:** `_id` = the gateway's per-attempt `request_id`. A
+  spend record is one HTTP *attempt*, and a client that retried three
+  times produces three records **sharing one trace ID**. Keying those on
+  trace ID would make each attempt overwrite the last — collapsing three
+  enforcement events into one and destroying the retry evidence at index
+  time.
+
+This is enforced in one place (`model.LLMEvent.DocumentID`) and pinned by
+`TestDocumentID_GatewayRetriesDoNotCollapse`. If you ever see gateway
+document counts lower than the number of spend records fetched, that test
+is the first thing to check.
 
 ### Add just the new field to the existing index (advanced, narrower)
 

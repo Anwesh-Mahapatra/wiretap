@@ -53,6 +53,11 @@
     "wiretap_outcome": "truncated",
     "wiretap_scenario": "wiretap-truncated"
   },
+  "related": {
+    "user": [
+      "anwesh-lab"
+    ]
+  },
   "tags": [
     "wiretap",
     "truncated"

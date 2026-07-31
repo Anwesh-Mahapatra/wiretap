@@ -1,0 +1,59 @@
+{
+  "@timestamp": "2026-07-30T23:02:49.643Z",
+  "ecs": {
+    "version": "9.4.0"
+  },
+  "event": {
+    "kind": "event",
+    "category": [
+      "api"
+    ],
+    "type": [
+      "denied"
+    ],
+    "action": "budget_exceeded",
+    "dataset": "wiretap.litellm",
+    "module": "wiretap",
+    "outcome": "failure",
+    "start": "2026-07-30T23:02:49.643Z",
+    "end": "2026-07-30T23:02:49.643Z"
+  },
+  "trace": {
+    "id": "probe-fill5-b967a34767bf"
+  },
+  "gen_ai": {
+    "operation": {
+      "name": "chat"
+    },
+    "system": "groq",
+    "request": {
+      "model": "llama-3.3-70b-versatile"
+    }
+  },
+  "http": {
+    "response": {
+      "status_code": 429
+    }
+  },
+  "error": {
+    "message": "Budget has been exceeded! Key=probe-budget-1 (sk-...XK8w) Current cost: 0.00011704999999999997, Max budget: 0.0001",
+    "type": "BudgetExceededError",
+    "code": "429"
+  },
+  "llm": {
+    "key": {
+      "alias": "probe-budget-1",
+      "hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "labels": {},
+  "related": {
+    "user": [
+      "probe-budget-1"
+    ]
+  },
+  "tags": [
+    "wiretap",
+    "probe-fill"
+  ]
+}

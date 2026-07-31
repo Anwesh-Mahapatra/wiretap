@@ -12,6 +12,7 @@ import (
 
 	"wiretap/internal/ecs"
 	"wiretap/internal/esink"
+	"wiretap/internal/model"
 	"wiretap/internal/parse"
 )
 
@@ -34,6 +35,34 @@ type IndexConfig struct {
 	// the index.
 	DryRun bool
 	ECS    ecs.Config
+	// Source selects which parser and mapper this indexer uses. The two
+	// planes' archives hold genuinely different record shapes -- a
+	// Langfuse trace and a LiteLLM spend record -- so pointing an indexer
+	// at the wrong archive is a real mistake, and this is what makes it a
+	// configuration choice rather than something inferred per line. The
+	// zero value is SourceLangfuse, which keeps every existing caller
+	// correct without change.
+	Source model.Source
+}
+
+// parseAndMap turns one archive line into an indexable document using the
+// pair appropriate to this indexer's source. Keeping the two pairs behind
+// one call site is what lets scan stay source-agnostic: everything else in
+// this file -- checkpointing, offsets, batching, dry-run -- is identical
+// for both planes and should not be duplicated to serve them.
+func (ix *Indexer) parseAndMap(line []byte, lineNo int) (*model.LLMEvent, *ecs.Document, error) {
+	if ix.cfg.Source == model.SourceLiteLLM {
+		ev, err := parse.ParseGatewayLine(line, lineNo)
+		if err != nil {
+			return nil, nil, err
+		}
+		return ev, ecs.MapGateway(ev, ix.cfg.ECS), nil
+	}
+	ev, err := parse.ParseLine(line, lineNo)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ev, ecs.Map(ev, ix.cfg.ECS), nil
 }
 
 // indexCheckpointState is the Indexer's own persisted progress: how many
@@ -158,7 +187,7 @@ func (ix *Indexer) scan(ctx context.Context, startOffset int64, startLine int, p
 			continue
 		}
 
-		ev, perr := parse.ParseLine(line, lineNo)
+		ev, doc, perr := ix.parseAndMap(line, lineNo)
 		if perr != nil {
 			result.ParseErrors++
 			ix.logger.Error("skipping unparsable archive line", "line", lineNo, "error", perr)
@@ -171,7 +200,16 @@ func (ix *Indexer) scan(ctx context.Context, startOffset int64, startLine int, p
 			continue
 		}
 
-		doc := ecs.Map(ev, ix.cfg.ECS)
+		// An event with no identifier cannot be indexed idempotently:
+		// Elasticsearch would auto-generate an _id, making every replay
+		// create a fresh duplicate. Skip rather than corrupt the
+		// backfill guarantee. See model.LLMEvent.DocumentID.
+		docID := ev.DocumentID()
+		if docID == "" {
+			result.Skipped++
+			ix.logger.Warn("skipping archive line with no document id", "line", lineNo)
+			continue
+		}
 
 		if ix.cfg.DryRun {
 			pretty, _ := json.MarshalIndent(doc, "", "  ")
@@ -180,7 +218,11 @@ func (ix *Indexer) scan(ctx context.Context, startOffset int64, startLine int, p
 			continue
 		}
 
-		if err := ix.sink.Add(ctx, ev.TraceID, doc); err != nil {
+		// _id comes from the event, not from a field this stage picks:
+		// the two planes need different rules and getting it wrong
+		// collapses retried gateway attempts onto one document. See
+		// model.LLMEvent.DocumentID.
+		if err := ix.sink.Add(ctx, docID, doc); err != nil {
 			return result, fmt.Errorf("queuing trace %q for indexing: %w", ev.TraceID, err)
 		}
 		result.Queued++

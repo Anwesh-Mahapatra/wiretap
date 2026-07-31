@@ -302,6 +302,24 @@ func loadFetchCheckpoint(path string) (*fetchCheckpointState, error) {
 	return &cp, nil
 }
 
+// loadJSONIfExists decodes path into v, treating a missing file as an
+// empty value rather than an error -- a checkpoint that has never been
+// written is the normal first-run state, not a failure. Shared by every
+// checkpoint loader so "absent means empty" is decided once.
+func loadJSONIfExists(path string, v any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %q: %w", path, err)
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("parsing %q: %w", path, err)
+	}
+	return nil
+}
+
 // saveFetchCheckpoint writes via a temp file plus rename so a crash
 // mid-write can never corrupt or truncate the existing checkpoint.
 func saveFetchCheckpoint(path string, cp *fetchCheckpointState) error {

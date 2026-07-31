@@ -53,6 +53,11 @@
     "wiretap_outcome": "benign",
     "wiretap_scenario": "wiretap-benign"
   },
+  "related": {
+    "user": [
+      "anwesh-lab"
+    ]
+  },
   "tags": [
     "wiretap",
     "benign"

@@ -577,3 +577,45 @@ func (c *Client) decodeForTest(body []byte) (*SpendLogPage, error) {
 		PageSize: raw.PageSize, TotalPages: raw.TotalPages, TotalIsCapped: raw.TotalIsCapped,
 	}, nil
 }
+
+// TestSpendLog_HasUsageHasCost_ExplicitNull pins a safety that is
+// currently incidental rather than deliberate.
+//
+// HasUsage and HasCost distinguish "LiteLLM measured this" from "the NOT
+// NULL column defaulted to 0". They work because UsageObject and
+// CostBreakdown are map[string]any, and encoding/json decodes a JSON null
+// into a nil map. Had those fields been declared json.RawMessage -- a
+// completely plausible refactor, and the type the archive parser uses --
+// a null would decode into the four bytes "null", which is non-nil, and
+// both methods would report true for exactly the records that have no
+// data. That bug was written and caught in internal/parse; this test
+// exists so the same change here fails loudly instead.
+func TestSpendLog_HasUsageHasCost_ExplicitNull(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"explicit null", `{"metadata":{"usage_object":null,"cost_breakdown":null}}`, false},
+		{"absent", `{"metadata":{}}`, false},
+		{"no metadata", `{}`, false},
+		{"present and populated", `{"metadata":{"usage_object":{"total_tokens":39},"cost_breakdown":{"total_cost":0.1}}}`, true},
+		// An empty object is a real, present statement -- LiteLLM said "I
+		// have a usage object and it is empty" -- which is different from
+		// null. Treated as present.
+		{"present but empty", `{"metadata":{"usage_object":{},"cost_breakdown":{}}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s SpendLog
+			if err := json.Unmarshal([]byte(tc.raw), &s); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := s.HasUsage(); got != tc.want {
+				t.Errorf("HasUsage() = %v, want %v", got, tc.want)
+			}
+			if got := s.HasCost(); got != tc.want {
+				t.Errorf("HasCost() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

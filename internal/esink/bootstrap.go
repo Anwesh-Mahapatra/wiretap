@@ -8,15 +8,92 @@ import (
 	"net/http"
 )
 
+// SharedIndexPattern is the pattern a Kibana data view (and any
+// cross-plane query) should point at to see both datasets at once.
+//
+// Both index bases below deliberately start with "wiretap-llm-" so this
+// one pattern covers them. That is what lets a single data view -- and,
+// more importantly, an EQL sequence query, which cannot span two data
+// views -- correlate a content event with a gateway event. The two are
+// told apart by event.dataset, never by which index they came from.
+const SharedIndexPattern = "wiretap-llm-*"
+
+// Default index bases for the two datasets. Content keeps its original
+// name so no existing data has to be migrated for a purely cosmetic
+// symmetry with the gateway's.
+const (
+	DefaultContentIndexBase = "wiretap-llm-events"
+	DefaultGatewayIndexBase = "wiretap-llm-gateway"
+)
+
+// Dataset selects which mapping an index template gets. The two datasets
+// share most of their schema (see sharedProperties) and differ only in the
+// fields one plane can report and the other structurally cannot.
+type Dataset int
+
+const (
+	// DatasetContent is the Langfuse content plane: prompts, responses,
+	// generation counts. event.dataset "wiretap.langfuse".
+	DatasetContent Dataset = iota
+	// DatasetGateway is the LiteLLM gateway plane: key identity, HTTP
+	// status, structured error class. event.dataset "wiretap.litellm".
+	DatasetGateway
+)
+
+func (d Dataset) String() string {
+	if d == DatasetGateway {
+		return "gateway"
+	}
+	return "content"
+}
+
+// mapping returns the explicit field mapping for this dataset.
+func (d Dataset) mapping() map[string]any {
+	if d == DatasetGateway {
+		return gatewayIndexMapping()
+	}
+	return contentIndexMapping()
+}
+
 // BootstrapConfig names the index template, concrete index, and write
-// alias Bootstrap creates. IndexBase is the only thing callers need to
-// choose; the template name and concrete index name are both derived from
-// it so they can never drift apart from the alias they're meant to back.
+// alias Bootstrap creates for one dataset. IndexBase and Dataset are the
+// only things callers choose; the template name and concrete index name
+// are both derived from IndexBase so they can never drift apart from the
+// alias they're meant to back.
 type BootstrapConfig struct {
 	// IndexBase names the alias documents are actually indexed through
 	// (e.g. "wiretap-llm-events"). The concrete index backing it is
 	// IndexBase + "-000001".
 	IndexBase string
+	// Dataset selects the mapping. The zero value is DatasetContent,
+	// which keeps every existing caller correct without change.
+	Dataset Dataset
+}
+
+// DefaultBootstrapConfigs returns the configs for both datasets, in the
+// order they should be created. Callers that want non-default index names
+// build their own.
+func DefaultBootstrapConfigs() []BootstrapConfig {
+	return []BootstrapConfig{
+		{IndexBase: DefaultContentIndexBase, Dataset: DatasetContent},
+		{IndexBase: DefaultGatewayIndexBase, Dataset: DatasetGateway},
+	}
+}
+
+// BootstrapAll creates every config's template and index, and is what
+// `wiretapd bootstrap` calls. It does not stop at the first failure:
+// bootstrapping the gateway index must not be prevented by an unrelated
+// problem with the content one, for the same reason the two fetchers are
+// independent (see cmd/wiretapd). Every error encountered is returned
+// joined, so a caller sees all of them rather than the first.
+func (c *Client) BootstrapAll(ctx context.Context, cfgs []BootstrapConfig) error {
+	var errs []error
+	for _, cfg := range cfgs {
+		if err := c.Bootstrap(ctx, cfg); err != nil {
+			errs = append(errs, fmt.Errorf("%s dataset: %w", cfg.Dataset, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // TemplateName is the index template Bootstrap creates for cfg. Exported so
@@ -27,8 +104,8 @@ func (cfg BootstrapConfig) TemplateName() string  { return cfg.IndexBase + "-tem
 func (cfg BootstrapConfig) indexPattern() string  { return cfg.IndexBase + "-*" }
 func (cfg BootstrapConfig) concreteIndex() string { return cfg.IndexBase + "-000001" }
 
-// Bootstrap creates the index template (with explicit mappings -- see
-// indexMapping) and, if it doesn't already exist, the first concrete index,
+// Bootstrap creates the index template (with explicit mappings for this
+// dataset -- see mapping.go) and, if it doesn't already exist, the first concrete index,
 // which the template's own aliases block wires up to IndexBase
 // automatically on creation. Both steps are idempotent: PUTting the same
 // template definition twice is a plain overwrite (Elasticsearch's own
@@ -46,7 +123,7 @@ func (c *Client) Bootstrap(ctx context.Context, cfg BootstrapConfig) error {
 				"number_of_shards":   1,
 				"number_of_replicas": 0,
 			},
-			"mappings": indexMapping(),
+			"mappings": cfg.Dataset.mapping(),
 			"aliases": map[string]any{
 				cfg.IndexBase: map[string]any{
 					"is_write_index": true,
@@ -107,144 +184,4 @@ func (c *Client) exists(ctx context.Context, path string) (bool, error) {
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodGet, "/", "", nil)
 	return err
-}
-
-// indexMapping is the explicit field mapping for wiretap's ECS documents
-// (see internal/ecs.Document). No field here is left to dynamic mapping --
-// every key a Document can produce has a deliberate type below, chosen
-// against docs/reference/ecs-gen_ai.md's own type column where a field
-// comes from that fieldset.
-//
-// Two choices worth explaining inline rather than leaving implicit:
-//
-//   - llm.output and llm.user_prompt use Elasticsearch's "wildcard" type,
-//     not "keyword" or "text". The canary-token detection this project
-//     exists to demonstrate (see docs/DETECTIONS.md) is a leading-wildcard
-//     query, llm.output: *XK9-Canaries-77*. Leading wildcards are slow (and
-//     disabled by default) on "keyword", and "text"'s standard analyzer
-//     tokenizes on non-alphanumeric characters, which would silently break
-//     a substring match against a token containing punctuation or mixed
-//     case. "wildcard" exists in Elasticsearch specifically for this
-//     access pattern. Getting this one wrong doesn't break loudly -- the
-//     query just quietly returns nothing, which is why it's called out
-//     here instead of left for someone to discover the hard way.
-//   - llm.messages is "text" with "index": false. It exists for an analyst
-//     to read the full conversation when they click into a document, not
-//     to be searched -- the fields that matter for detection are
-//     llm.output and llm.user_prompt, the current turn, already broken out
-//     separately. Indexing the same content a second time (as wildcard,
-//     to make it searchable too) would roughly double this field's storage
-//     for a capability nothing in docs/DETECTIONS.md uses; index: false
-//     keeps it in _source (still retrievable, still displayable) without
-//     paying that cost.
-func indexMapping() map[string]any {
-	keyword := map[string]any{"type": "keyword"}
-	integer := map[string]any{"type": "integer"}
-	double := map[string]any{"type": "double"}
-	date := map[string]any{"type": "date"}
-	long := map[string]any{"type": "long"}
-	wildcard := map[string]any{"type": "wildcard"}
-
-	return map[string]any{
-		"properties": map[string]any{
-			"@timestamp": date,
-			"ecs": map[string]any{
-				"properties": map[string]any{"version": keyword},
-			},
-			"event": map[string]any{
-				"properties": map[string]any{
-					"kind":      keyword,
-					"category":  keyword,
-					"dataset":   keyword,
-					"module":    keyword,
-					"outcome":   keyword,
-					"duration":  long,
-					"ingested":  date,
-					"reference": keyword,
-				},
-			},
-			// error.message uses "match_only_text", the type ECS itself
-			// declares for this field. It is a space-efficient variant of
-			// "text" for log-style messages that are read and
-			// full-text-searched but never scored or phrase-position
-			// queried -- which is exactly how an enforcement message like
-			// "Budget has been exceeded! Key=bob (sk-...9SfA)" gets used.
-			// Deliberately NOT wildcard: unlike llm.output, no detection
-			// greps this for a mid-string exact substring; grouping and
-			// counting happen on the gateway plane's structured
-			// error.type/error.code instead.
-			"error": map[string]any{
-				"properties": map[string]any{
-					"message": map[string]any{"type": "match_only_text"},
-				},
-			},
-			"trace":   map[string]any{"properties": map[string]any{"id": keyword}},
-			"session": map[string]any{"properties": map[string]any{"id": keyword}},
-			"user":    map[string]any{"properties": map[string]any{"id": keyword}},
-			"gen_ai": map[string]any{
-				"properties": map[string]any{
-					"system":    keyword,
-					"operation": map[string]any{"properties": map[string]any{"name": keyword}},
-					"request": map[string]any{
-						"properties": map[string]any{
-							"model":      keyword,
-							"max_tokens": integer,
-						},
-					},
-					"response": map[string]any{
-						"properties": map[string]any{
-							"model": keyword,
-							"id":    keyword,
-							// No finish_reasons mapping: internal/ecs's
-							// genAIResponse doesn't have that field.
-							// Confirmed genuinely unavailable from this
-							// project's Langfuse data (see
-							// internal/ecs/genai.go's package doc and
-							// notes.md) -- mapping a field the document
-							// never sends would be dead, misleading
-							// schema.
-						},
-					},
-					"usage": map[string]any{
-						"properties": map[string]any{
-							"input_tokens":  integer,
-							"output_tokens": integer,
-						},
-					},
-				},
-			},
-			"llm": map[string]any{
-				"properties": map[string]any{
-					"system_prompt":  map[string]any{"type": "text"},
-					"user_prompt":    wildcard,
-					"output":         wildcard,
-					"output_role":    keyword,
-					"messages":       map[string]any{"type": "text", "index": false},
-					"message_count":  integer,
-					"output_length":  integer,
-					"total_cost_usd": double,
-					// generation_count: how many GENERATION observations
-					// contributed to gen_ai.usage.* above (see
-					// internal/parse's applyGenerations). Small, bounded
-					// counter -- integer, same reasoning as message_count/
-					// output_length above.
-					"generation_count": integer,
-					// errored_generation_count: how many of those
-					// generations the source reported at ERROR level, i.e.
-					// how many times the proxy refused this request. The
-					// field a "was this blocked" query keys on from the
-					// content plane, until the gateway plane's structured
-					// error.type supersedes it.
-					"errored_generation_count": integer,
-				},
-			},
-			"labels": map[string]any{
-				"properties": map[string]any{
-					"wiretap_outcome":  keyword,
-					"wiretap_scenario": keyword,
-				},
-			},
-			"tags": keyword,
-		},
-	}
 }

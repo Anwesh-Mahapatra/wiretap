@@ -53,6 +53,11 @@
     "wiretap_outcome": "injection",
     "wiretap_scenario": "wiretap-injection"
   },
+  "related": {
+    "user": [
+      "anwesh-lab"
+    ]
+  },
   "tags": [
     "wiretap",
     "injection"

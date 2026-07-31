@@ -390,3 +390,176 @@ of its current size. If it is the latter, either derive it or leave a
 comment saying which second example will break it. All three of the bugs
 above would have been caught by that question, and none of them were
 caught by review.
+
+### `json.RawMessage` makes absent and explicitly-null indistinguishable to `!= nil`
+
+This one is not an assumption about the data. It is a language-level
+detail with a sharp edge, and it produced a bug in the exact parser
+written to prevent that bug's twin.
+
+**The rule, in grep-able form:**
+
+> `json.RawMessage` is the only standard Go type where a JSON `null`
+> decodes to something other than the zero value. `null` becomes the four
+> bytes `"null"` — **non-nil, length 4**. For every other type (`*T`,
+> `map`, `slice`, `interface{}`, `string`, …) `null` and absent both give
+> the zero value, so `!= nil` is safe. **Never presence-check a
+> `json.RawMessage` with `!= nil`.** Use `parse.jsonPresent`, which
+> treats absent and explicit-null identically.
+
+Verified empirically rather than assumed:
+
+```
+input {"v":null,"m":null,"p":null,"s":null,"t":null}
+  json.RawMessage: nil=false  len=4  bytes="null"   <-- the trap
+  map[string]any:  nil=true
+  *int:            nil=true
+  []string:        nil=true
+  string:          ""
+input {}
+  json.RawMessage: nil=true   len=0
+```
+
+**Where it bit.** LiteLLM's spend records report `spend: 0.0` and
+`prompt_tokens: 0` on a request it *refused* — the columns are
+`NOT NULL DEFAULT 0`, so a request that never reached a model still reads
+as having cost nothing. The honest discriminator is LiteLLM's own
+`metadata.usage_object` and `metadata.cost_breakdown`, which are `null`
+exactly when there is nothing to report. The gateway parser declared those
+as `json.RawMessage` and checked `!= nil`, which reports **present** for
+every null — so a blocked request would once again have indexed as a free,
+successful one. Same wrong answer as the content-plane bug, reached
+through an entirely different door, in the code written to fix it.
+
+It was caught by a fixture test, not by review. The fixtures are real
+refused records, and the assertion was "usage must be absent"; nothing
+about reading the code suggested `!= nil` was wrong.
+
+**Audit of every other site.** Done deliberately, once, rather than
+waiting for the next instance:
+
+| Site | Type | Verdict |
+|---|---|---|
+| `parse.applyGatewayUsage` — `usage_object`, `cost_breakdown` | `json.RawMessage` | **Was wrong**; now uses `jsonPresent` |
+| `parse.decodeObservations` / `decodeMessages` / `decodeOutput` | `json.RawMessage` | Correct — each already compared against the literal `"null"`, written out inline three times. Consolidated onto `jsonPresent` so the rule lives in one place; three copies of a subtle guard is how the fourth site came to lack it |
+| `parse.wireSpendLog.traceID` — `spend_logs_metadata` | `map[string]json.RawMessage` | Safe: the *map* is nil on null. A null *value* under `trace_id` still yields `"null"` bytes, which unmarshal into `""` without error — caught only by the empty-string guard. Now pinned by a test |
+| `litellm.SpendLog.HasUsage` / `HasCost` | `map[string]any` | Safe, but **incidentally** — nil map on null. Declaring those `json.RawMessage` for consistency with the parser would silently reintroduce the bug. Now pinned by a test |
+| `pipeline.enrichTrace` — `r.raw == nil` | `json.RawMessage` | Safe: assigned from an HTTP response body, never unmarshalled into |
+| `esink` — `doc`, `Document` | `json.RawMessage` | N/A: marshal direction only |
+
+Two of those were safe only because of a type choice nobody made for this
+reason. Both now have tests that fail if the type changes, which is the
+difference between "correct" and "correct on purpose".
+
+**Why this is worth its own entry.** The constants above are an assumption
+about the world: *there will only ever be one of these.* This is an
+assumption about the language: *nil means absent.* The first is caught by
+imagining a second example. The second is caught only by knowing one
+specific implementation detail of `encoding/json`, or by a test that feeds
+a real record containing a real null. The general defence is the same in
+both cases — construct the case that would disagree — but the thing you
+have to know in order to construct it is completely different.
+
+### The incomplete-value variant: `event.category` and the detection that never fires
+
+`event.category` is ECS's "big buckets" field and is defined as an
+**array**. This project set it to `["api"]` and nothing else, everywhere,
+including on authentication failures.
+
+That is the quietest member of the hardcoded-constant family, because it is
+not a *wrong* value — it is an **incomplete** one. `["api"]` is correct
+for every request this pipeline indexes. It is simply missing
+`"authentication"` on the events where that also applies.
+
+The failure mode is the nastiest shape available: a detection filtering
+`event.category: "authentication"` returns **zero hits, forever**, and zero
+hits reads exactly like *"no authentication failures occurred."* There is
+no wrong value to notice, no empty field to spot, no type error, and no
+document that looks odd on inspection. The rule is correct, the data is
+correct as far as it goes, and the answer is silently false.
+
+Compare the three variants now recorded here:
+
+| Variant | Example | How it fails | How it looks |
+|---|---|---|---|
+| Wrong value | `gen_ai.system: "groq"` on an OpenAI response | Populated, plausible, false | Fine from every angle |
+| Missing value | `gen_ai.*` empty after the list-endpoint bug | Absent | Visible — someone asks why |
+| **Incomplete value** | `event.category: ["api"]` on an auth failure | Correct but partial | **A query returning zero** |
+
+The middle one is the only member of the family that announces itself.
+
+### The defect that lived between two correct decisions
+
+Every failure recorded above produced a *document* that was wrong or
+incomplete. You could find each one by looking at data: a merged trace, an
+empty `gen_ai.*`, a blocked request claiming zero cost, a model that never
+answered, a category missing a value. Inspect enough records and the bug is
+there to see.
+
+This one is different, and it is worth its own entry because the technique
+for catching the others does not catch it.
+
+**Two decisions, each correct in isolation.**
+
+1. `llm.system_prompt`, `llm.user_prompt` and `llm.output` are deliberately
+   **not** `omitempty`. On the content plane an empty prompt is a fact
+   worth recording — a trace with no system message at all is real, and
+   silently omitting the field would make it indistinguishable from a
+   trace nobody looked at. This was a considered decision with a comment
+   explaining it.
+2. The gateway plane emits no content, because it has none. LiteLLM's spend
+   records carry an empty `messages` and `response` field by construction.
+   Also correct, also documented.
+
+**The interaction.** With both in force, every gateway document serialized
+`"output": ""`, `"user_prompt": ""`, `"system_prompt": ""`. Each document
+was *correct*: the gateway genuinely has no output, and the field genuinely
+is not omitted. Nothing about either plane was wrong.
+
+What broke was a **query**. The canary detection's negative case —
+`NOT llm.output: *`, meaning "find requests where the model returned
+nothing" — silently acquired a second meaning: *"or it is a gateway
+document."* Once both datasets sat behind one index pattern, that clause
+matched every spend record ever indexed. The rule still ran. It still
+returned results. The results were wrong, and no document anywhere was
+wrong.
+
+**The general form:** *a defect living in the interaction between two
+individually correct decisions, manifesting only in query results rather
+than in stored data.*
+
+**Why it survives review.** A reviewer examines one plane at a time —
+that is what a diff shows, and it is how the code is organised. Reading
+the content mapper, the non-`omitempty` choice is right and its comment
+justifies it. Reading the gateway mapper, emitting no content is right.
+Neither review finds anything, because there is nothing in either place to
+find. The defect is not in a file; it is in the space between two files,
+and it becomes real only at query time, in a third system, under a
+condition (shared index pattern) that neither file mentions.
+
+This is also why the earlier defences do not help. "Imagine a second
+example" catches the constants. "Feed a real null" catches the
+`RawMessage` trap. Both are about *this* record being right. Here every
+record was right.
+
+**What actually caught it** was a test asserting a property of the
+*relationship* rather than of either side:
+`TestMapGateway_NoContentFieldsEverEmitted` says a gateway document must
+carry no content field at all — a rule that only makes sense once you know
+another plane exists and shares a namespace with this one. It failed on
+seven fields the first time it ran.
+
+**Detection implication, and this is the actionable part.** Adding a second
+dataset behind a shared index pattern changes the meaning of **every
+existing rule with a negative clause**. `NOT`, `must_not`, `!=`, "field
+does not exist", "field is empty" — each of these was written when one
+dataset existed and implicitly meant "…among content events". None of them
+say so.
+
+So every such rule needs re-examining, and the fix is nearly always to add
+an explicit `event.dataset` filter rather than to rely on a field's
+absence carrying the distinction. A positive clause degrades safely when a
+new dataset arrives — it simply does not match. A negative clause does the
+opposite: it matches *more*, silently, and the extra matches look like
+findings. `docs/DETECTIONS.md` now states this as a standing rule for any
+rule added to this project.

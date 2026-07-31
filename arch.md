@@ -299,6 +299,54 @@ tool for anyone who specifically wants a plain, unenriched, faithful pipe
 with nothing else attached; it's just not part of the default compose
 services anymore.
 
+### Two fetchers now, and why that is not the same race
+
+wiretapd now runs **two** fetchers — one against Langfuse, one against
+LiteLLM's spend API. That looks superficially like the arrangement that
+was just removed, so it is worth writing down exactly why it is not,
+rather than leaving it to be inferred from the archives having different
+names.
+
+**What the original race actually was.** `tracepump` and `wiretapd` both
+fetched *from the same source* and both appended *to the same archive
+file*, while keeping *separate checkpoints*. Nothing coordinated them, so
+the same trace could be fetched by both and appended twice — once in the
+list shape (`observations` as bare ID strings) and once in the enriched
+detail shape (full objects). The indexer reads the archive in order and
+keys every document on its `_id`, so whichever copy came last won. A trace
+could be indexed correctly with full `gen_ai.*` fields and then silently
+overwritten by the impoverished copy. No error, no duplicate document,
+just fields that vanished.
+
+The essential ingredients were: **two writers, one stream, one `_id`
+space, and no ordering guarantee between them.**
+
+**Every piece of state the two fetchers could share, and how each is
+isolated:**
+
+| Shared thing | Status | Why |
+|---|---|---|
+| The source API | **Not shared** | Different systems entirely. Langfuse's trace API and LiteLLM's spend API have no common cursor, no common rate limit, and no knowledge of each other. |
+| The archive file | **Not shared** | `WIRETAPD_ARCHIVE` and `WIRETAPD_GATEWAY_ARCHIVE` are distinct paths, and each is opened `O_APPEND` by exactly one writer. They live in the same directory, but a directory is a namespace, not mutable state — appends to different inodes cannot interleave. |
+| The fetch checkpoint | **Not shared** | Distinct paths. Note the non-obvious part: `atomicWriteJSON` writes to `path + ".tmp"` before renaming, so the temp filenames are derived from the real ones and are distinct too. Had both used one path, the `.tmp` files would have clobbered each other *before* the rename made it visible. |
+| The index checkpoint | **Not shared** | Distinct paths, same reasoning. Four checkpoints total. |
+| The dead-letter file | **Was shared — now isolated** | Both indexers defaulted to `dead-letter.json` in the working directory. Appends would not have corrupted bytes, but `DeadLetterRecord` carries no dataset field, so replaying the file could not tell which index a record belonged to. Now one path per source. This one was a real finding, not a hypothetical. |
+| The Elasticsearch `_id` space | **Not shared** | Different indices *and* different ID rules — trace ID for content, per-attempt `request_id` for gateway (see `model.LLMEvent.DocumentID`). Even a hypothetical collision could not overwrite across indices. |
+| The `BulkIndexer` | **Not shared** | One instance per source, with its own batch buffer and its own counters. |
+
+**The invariant, stated plainly:** *each archive has exactly one writer,
+and each index has exactly one indexer.* The original race required two
+writers on one stream; here there are two streams with one writer each.
+That is a structural property, not a timing accident — it does not depend
+on the two loops happening to run at different intervals, and it holds
+just as well if one of them stalls for an hour.
+
+The one thing the two fetchers genuinely do share is the *process*: they
+run as goroutines in one `wiretapd`. That is deliberate, and it is why
+each loop's failure is contained (see `runFetchLoop`) — a panic or error
+in one must not take down the other, or "Langfuse is down" would silently
+become "gateway ingestion stopped too.".
+
 ```mermaid
 sequenceDiagram
     participant You as You

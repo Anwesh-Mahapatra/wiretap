@@ -1,0 +1,55 @@
+{
+  "@timestamp": "2026-07-30T23:03:11.219Z",
+  "ecs": {
+    "version": "9.4.0"
+  },
+  "event": {
+    "kind": "event",
+    "category": [
+      "api",
+      "authentication"
+    ],
+    "type": [
+      "denied",
+      "start"
+    ],
+    "action": "auth_failure",
+    "dataset": "wiretap.litellm",
+    "module": "wiretap",
+    "outcome": "failure",
+    "start": "2026-07-30T23:03:11.219Z",
+    "end": "2026-07-30T23:03:11.219Z"
+  },
+  "trace": {
+    "id": "probe-authfail-b469cbc39f389eea"
+  },
+  "gen_ai": {
+    "operation": {
+      "name": "chat"
+    },
+    "system": "groq",
+    "request": {
+      "model": "llama-3.3-70b-versatile"
+    }
+  },
+  "http": {
+    "response": {
+      "status_code": 401
+    }
+  },
+  "error": {
+    "message": "Authentication Error, Invalid proxy server token passed. Received API Key = sk-...Tj3w, Key Hash (Token) =aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Unable to find token in cache or `LiteLLM_VerificationTokenTable`",
+    "type": "KeyNotFoundError",
+    "code": "401"
+  },
+  "llm": {
+    "key": {
+      "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "labels": {},
+  "tags": [
+    "wiretap",
+    "probe-authfail"
+  ]
+}
