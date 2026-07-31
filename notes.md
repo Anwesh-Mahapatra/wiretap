@@ -1,3 +1,78 @@
+# Failure notes
+
+This file is a catalog of the eight distinct failure classes this project
+has actually hit, in the order they were discovered, plus the
+field-definition notes that predate them. Each class gets its own section
+below; this index exists so the pattern is visible before the detail.
+
+Grouped by **defence**, because that is the useful axis — two failures
+with the same defence are the same lesson:
+
+**Assumptions falsified by data variety** — the code was right about every
+example it had ever seen, and wrong about the world. Defence: construct
+the example that would disagree.
+
+1. **Merged traces** — `trace_id` and `session_id` treated as
+   interchangeable; plausible, fully populated, entirely false documents.
+   *A test could only have caught this with two traces sharing one
+   session — data that had never existed in any fixture.*
+2. **The empty `gen_ai.*` fields** — a schema that validated, tested
+   green, and emitted nothing, because the fetch never asked for the
+   detail that carries the values. *Tests were green throughout; catching
+   it required the real API response shape, which no fixture had ever
+   contained.*
+3. **The canary in the system prompt** — a detection written against
+   "the canary string" instead of "the canary string **in the output**";
+   the canary legitimately exists in the input. *Test-catchable — and a
+   regression test now guards it.*
+4. **Array order is not chronological order** — hid behind one
+   generation per trace. *Required constructing a multi-generation trace,
+   which had never existed.*
+
+**Constants with one example** — a hardcoded value that is correct until
+the day it isn't. Defence: imagine a second example.
+
+5. **The constant standing in for a value** (`gen_ai.system: "groq"`,
+   and the incomplete-value variant `event.category: ["api"]`, whose
+   failure shape is a query returning zero forever). *Test-catchable —
+   one test with a non-Groq model string.*
+
+**Language-level traps** — an assumption about the toolchain, not the
+data. Defence: know the one implementation detail, or feed a real record.
+
+6. **`json.RawMessage` and `!= nil`** — a JSON `null` decodes to four
+   non-nil bytes; absent and explicitly-null become indistinguishable.
+   *Caught by a fixture test feeding a real null, not by review.*
+
+**Interaction defects** — every individual decision correct; the defect
+lives between them and manifests only in query results. Defence: test
+properties of the relationship, not of either side.
+
+7. **The defect between two correct decisions** — non-`omitempty` content
+   fields × a gateway plane with no content = every gateway document
+   matching "model returned nothing." *Caught by a test asserting a
+   cross-plane property — a test that only makes sense once you know the
+   other plane exists.*
+
+**Retroactive invalidation** — the artifact was correct when written; an
+unrelated, itself-correct change altered what it matched. Defence lives
+at change time, not write time: ask which existing artifacts a schema
+change invalidates.
+
+8. **Rule #7's negative clause** — adding a second dataset behind the
+   shared index pattern changed what `not gen_ai.response.model: "..."`
+   matched. *No write-time test could have caught it; there was nothing
+   wrong to catch. The audit habit is the only defence, and it applies to
+   every dashboard, saved search, and index template too.*
+
+Two honest footnotes to the pattern: "positive clauses degrade safely"
+holds for *matching* rules and fails for *aggregating* ones (fields that
+now exist on both planes double-count — class 8's entry carries the
+detail), and the recurring shape across all eight is a confident,
+precise, wrong answer rather than an obviously broken one.
+
+---
+
 ### Field Definitions & Detection Logic
 
 * **`trace_id`**: Acts as a pivot or join key. It goes in YARA-L outcome variables, not the condition. It is emitted as evidence for investigations to reconstruct attack chains.
@@ -563,3 +638,66 @@ new dataset arrives — it simply does not match. A negative clause does the
 opposite: it matches *more*, silently, and the extra matches look like
 findings. `docs/DETECTIONS.md` now states this as a standing rule for any
 rule added to this project.
+
+### The artifact invalidated retroactively (rule #7's bug class)
+
+The audit of the existing detections against that standing rule surfaced a
+class the seven entries above do not cover, and it is worth naming
+separately because the defence is different.
+
+Every failure recorded so far was **present at write time and discovered
+later** — the constant with no second example, the null that looks like a
+value, the schema that emitted nothing. Detection #7 (the model-routing
+rule) was different: it was **correct when written, and became wrong
+retroactively**. Adding a second dataset behind the shared index pattern —
+an unrelated, itself-correct change — altered what its negative clause
+matched. `not gen_ai.response.model: "..."` used to mean "the served model
+wasn't the expected one, among content events"; afterwards it also meant
+"or it is a gateway refusal, which has no served model." No code changed,
+no document was wrong, nothing broke, and nobody touched the rule. The
+rule's meaning changed underneath it.
+
+**The general form:** *an artifact invalidated by a change elsewhere in
+the system, where neither the artifact nor the change is wrong on its
+own.* The artifact is a consumer of a shared namespace; the change alters
+what that namespace contains; and the coupling between them is invisible
+in both diffs — the detection rule does not mention the index pattern,
+the index-pattern change does not mention the rule.
+
+**The defence is not the one the other seven taught.** Better review at
+write time cannot catch this, because there was nothing wrong to catch —
+the rule was right, and a review of the change that broke it would show
+only a correct new dataset. The defence is a habit at *change* time, not
+write time: **when a schema, mapping, or index change lands, ask which
+existing artifacts it invalidates.** And "artifacts" is deliberately
+broader than detection rules — the same question applies to every
+dashboard, saved search, visualization, and index template in a real
+deployment, each of which is a query-shaped consumer of the same shared
+namespace with the same silent failure modes. A schema change's blast
+radius is everything that ever queried the namespace, not everything in
+the diff.
+
+**The aggregation correction, recorded so the standing rule isn't
+over-read.** "A positive clause degrades safely" is true for *matching*
+rules and false for *aggregating* ones. Detections #4–#6 have no negative
+clause and still changed meaning, because `gen_ai.usage.*` and
+`llm.total_cost_usd` now exist on **both planes for the same request** —
+an unfiltered sum over the shared pattern counts every request twice and
+silently re-baselines the alert. The two per-field findings from the audit
+are the reason cross-plane aggregation is dangerous rather than merely
+redundant:
+
+- **`user.id`** is authoritative on the content plane (the end user who
+  asked). On the gateway plane the same field carries LiteLLM's own
+  `user` parameter (`default_user_id` in this deployment) — same name,
+  different meaning. Group by it unfiltered and one human becomes two
+  actors.
+- **`session.id`** is trustworthy only on the content plane. LiteLLM
+  discards the caller's `session_id` on a refused request and substitutes
+  a random UUID, so gateway-side session grouping is corrupted by
+  construction, not by accident.
+
+Same-name-different-meaning is what makes a cross-plane aggregation
+produce a confident, precise, wrong number instead of an obviously broken
+one — the same failure shape as every other entry in this file, arrived
+at by arithmetic.

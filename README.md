@@ -114,8 +114,17 @@ something's broken, not the last.
 | `docs/reference/ecs-gen_ai.md` | Elastic's own Gen AI field reference, saved locally — `internal/ecs` is checked against this file field-by-field |
 | `docs/DETECTIONS.md` | The payoff: real detection queries, what they depend on, and what's still missing |
 | `arch.md` | The design decisions behind this pipeline, and why |
-| `notes.md` | Field-by-field detection-engineering notes, plus two real incidents this project ran into and how they were fixed |
+| `notes.md` | **The failure catalog** — eight distinct classes of confident, precise, wrong answer this project actually produced, grouped by the defence that catches each, with a one-line index at the top. The most reusable thing in this repository |
 | `RUNBOOK.md` | Startup order, port reference, and troubleshooting |
+
+If you read one document in this repo beyond this README, read
+[notes.md](notes.md). The detections in `docs/DETECTIONS.md` are the
+payoff; notes.md is why you should believe them — every wrong answer this
+pipeline ever produced is recorded there with its cause and its defence,
+and the patterns (a schema that tests green and emits nothing, a constant
+that's right until the day it isn't, a rule that becomes wrong when an
+unrelated change lands) transfer to any observability pipeline, not just
+this one.
 
 ## A note on scope
 
