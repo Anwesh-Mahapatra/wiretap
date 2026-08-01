@@ -30,10 +30,20 @@ const (
 
 	pageLimit = 100
 
-	// healthCheckTag marks traces LiteLLM generates for its own periodic
-	// model health checks: empty input.messages, null userId/sessionId.
-	// Real, not synthetic, but noise for anything computing per-user or
-	// per-session baselines downstream.
+	// healthCheckTag marks the traffic LiteLLM generates for its own model
+	// health checks: on a Langfuse trace, empty input.messages and null
+	// userId/sessionId; on a LiteLLM spend row, null spend_logs_metadata
+	// and so no join key at all. Real, not synthetic -- these requests
+	// reach the provider and cost money -- but noise for anything
+	// computing per-user, per-session or per-key baselines downstream, and
+	// on the gateway plane a permanent floor under join health's
+	// without-join-key count.
+	//
+	// One constant, both fetchers: LiteLLM stamps this same literal onto a
+	// health check as a request tag *and* as the identity of the service
+	// account it bills, so the content plane's tag test and the gateway
+	// plane's are the same test on the same fact. See
+	// gatewayRecordCore.isHealthCheck.
 	healthCheckTag = "litellm-internal-health-check"
 )
 

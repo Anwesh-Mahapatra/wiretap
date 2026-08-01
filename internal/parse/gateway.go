@@ -68,10 +68,11 @@ func ParseGatewayLine(line []byte, lineNo int) (*model.LLMEvent, error) {
 	}
 
 	ev := &model.LLMEvent{
-		Source:       model.SourceLiteLLM,
-		Tags:         cleanRequestTags(wr.RequestTags),
-		Gateway:      gw,
-		SourceRecord: append([]byte(nil), line...),
+		Source:        model.SourceLiteLLM,
+		Tags:          cleanRequestTags(wr.RequestTags),
+		IsHealthCheck: isGatewayHealthCheck(&wr),
+		Gateway:       gw,
+		SourceRecord:  append([]byte(nil), line...),
 	}
 
 	// The join key. Absent is a real, expected state -- every request made
@@ -210,6 +211,62 @@ func applyGatewayUsage(ev *model.LLMEvent, wr *wireSpendLog) {
 func jsonPresent(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+// isGatewayHealthCheck reports whether this spend record describes one of
+// LiteLLM's own model health checks rather than caller traffic.
+//
+// Health checks are real requests -- they reach the provider, burn tokens
+// and cost money, which is why they get a spend row at all -- but they
+// carry no caller, no session and no spend_logs_metadata, so they can
+// never hold this project's join key. Left in, every one of them is a
+// permanent contribution to join health's without-join-key count and to
+// any per-key baseline computed off the gateway index. The content plane
+// has dropped them since it was written; this is the same decision on the
+// same evidence.
+//
+// LiteLLM stamps a health check in two independent places, both with the
+// literal in healthCheckTag (verified against a live proxy and against
+// litellm/litellm_core_utils/health_check_helpers.py):
+//
+//	_get_metadata_for_health_check_call
+//	  -> {"tags": [<sentinel>]}, which surfaces as request_tags on the
+//	     spend row and as the trace tag the content plane already keys on
+//	_update_model_params_with_health_check_tracking_information
+//	  -> UserAPIKeyAuth.get_litellm_internal_health_check_user_api_key_auth(),
+//	     a synthetic service account whose api_key, key_alias, team_id and
+//	     team_alias are all <sentinel>, which surfaces as the record's
+//	     api_key, metadata.user_api_key, metadata.user_api_key_alias,
+//	     team_id and metadata.user_api_key_team_id
+//
+// Both are checked rather than just the tag, because they fail
+// differently. request_tags is caller-supplied: any client may pass that
+// tag in litellm_metadata, so it is not proof of provenance -- an exposure
+// the content plane already carries, inherited here rather than
+// introduced, and worth knowing about given that matching here *removes*
+// records from a security index. The service-account fields are the
+// proxy's own statement about who it billed and cannot be set by a caller.
+// Neither alone is both trustworthy and durable; together, a health check
+// still gets recognised if LiteLLM moves one of the two stamps.
+//
+// Nothing here keys on call_type: a health check is an ordinary
+// "acompletion", indistinguishable from real chat traffic on that field.
+func isGatewayHealthCheck(wr *wireSpendLog) bool {
+	if hasTag(wr.RequestTags, healthCheckTag) {
+		return true
+	}
+	for _, identity := range []string{
+		wr.APIKey,
+		wr.TeamID,
+		wr.Metadata.UserAPIKey,
+		wr.Metadata.UserAPIKeyAlias,
+		wr.Metadata.UserAPIKeyTeamID,
+	} {
+		if identity == healthCheckTag {
+			return true
+		}
+	}
+	return false
 }
 
 // wireSpendLog mirrors the fields of one /spend/logs/v2 record this parser

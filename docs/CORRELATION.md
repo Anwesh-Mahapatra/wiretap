@@ -210,8 +210,22 @@ window ends at `now - 120s`, comfortably clear of both.
 **Expected baseline is zero, and that matters.** Anything that is
 *legitimately* unmatched must be excluded from the denominator rather than
 tolerated as noise, because a metric with a fuzzy normal range cannot be
-alerted on. Known exclusions: LiteLLM's own health-check traces (tagged
-`litellm-internal-health-check`, already filtered by the indexer).
+alerted on. Known exclusions: LiteLLM's own health checks, dropped on
+**both** planes by `--skip-healthchecks` (on by default) at fetch and at
+index.
+
+A health check produces a Langfuse trace *and* a LiteLLM spend row, and
+the spend row carries no `spend_logs_metadata` — so it can never hold a
+join key. Filtering one plane but not the other therefore does not merely
+leave noise: it puts a permanent nonzero floor under
+`gateway_docs_without_join_key` and skews any per-key baseline computed
+off the gateway index. LiteLLM marks both sides with the same literal,
+`litellm-internal-health-check` — as a request tag (which reaches Langfuse
+as a trace tag and the spend row as `request_tags`) and as the identity of
+the synthetic service account it bills (`api_key`, `team_id`,
+`metadata.user_api_key{,_alias}`, `metadata.user_api_key_team_id`). Both
+are checked; `call_type` is not one of them, since a health check is an
+ordinary `acompletion`. See `parse.isGatewayHealthCheck`.
 
 A non-zero rate is an incident, not a curiosity, and the runbook says so.
 

@@ -54,9 +54,19 @@ import (
 	"wiretap/internal/model"
 )
 
-// healthCheckTag marks traces LiteLLM generates for its own periodic model
+// healthCheckTag marks the traffic LiteLLM generates for its own model
 // health checks. Kept in sync with cmd/tracepump's constant of the same
 // name and meaning.
+//
+// One literal, both planes. LiteLLM defines it once
+// (LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME in litellm/constants.py)
+// and stamps it onto a health check twice over -- as a request tag, which
+// is what reaches Langfuse as a trace tag, and as the identity of the
+// synthetic service account the call is billed to, which is what reaches
+// the spend row. So the content plane matching a trace tag and the gateway
+// plane matching a spend record are matching the same fact from the same
+// source, not two conventions that happen to agree. See
+// isGatewayHealthCheck for the gateway-side fields.
 const healthCheckTag = "litellm-internal-health-check"
 
 // scenarioNamePrefix is how main.go names every trace it produces (see

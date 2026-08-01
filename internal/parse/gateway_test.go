@@ -429,6 +429,95 @@ func TestParseGatewayLine_MissingJoinKeyIsAbsentNotInvented(t *testing.T) {
 	}
 }
 
+// TestParseGatewayLine_HealthCheck asserts the gateway plane recognises
+// LiteLLM's own health-check rows, which the content plane has always
+// recognised by trace tag.
+//
+// The fixture is a real /spend/logs/v2 record produced by hitting the
+// proxy's own GET /health. Note what it is *not* distinguishable by:
+// call_type is a plain "acompletion", status is "success", and both
+// usage_object and cost_breakdown are populated -- it really did reach
+// Groq and really did cost money. What it has instead is a null
+// spend_logs_metadata, hence no join key, which is exactly why leaving
+// these in the gateway index puts a permanent floor under join health's
+// without-join-key count.
+func TestParseGatewayLine_HealthCheck(t *testing.T) {
+	ev, err := ParseGatewayLine(readFixture(t, "gateway_health_check.json"), 1)
+	if err != nil {
+		t.Fatalf("ParseGatewayLine: %v", err)
+	}
+	if !ev.IsHealthCheck {
+		t.Error("IsHealthCheck = false, want true")
+	}
+	if ev.TraceID != "" {
+		t.Errorf("TraceID = %q, want empty -- a health check carries no spend_logs_metadata", ev.TraceID)
+	}
+	if ev.Status != model.StatusSuccess {
+		t.Errorf("Status = %v, want success -- a health check is a real request that really ran", ev.Status)
+	}
+	if ev.InputTokens == nil || ev.OutputTokens == nil {
+		t.Error("usage is absent, want present -- the fixture has a real usage_object, and treating it as absent would hide that these rows cost money")
+	}
+}
+
+// TestParseGatewayLine_HealthCheckStamps covers each of LiteLLM's two
+// independent stamps on its own, plus the negative case.
+//
+// Both stamps are checked in production because they fail differently:
+// request_tags is caller-supplied and therefore spoofable, while the
+// service-account identity fields are the proxy's own statement about who
+// it billed. A record carrying either one alone must still be recognised,
+// or a future LiteLLM that moves one stamp silently reopens the join-health
+// floor this filter closed.
+func TestParseGatewayLine_HealthCheckStamps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{
+			name: "request tag alone",
+			raw:  `{"request_id":"r1","request_tags":["litellm-internal-health-check"],"metadata":{}}`,
+			want: true,
+		},
+		{
+			name: "service account key alias alone",
+			raw:  `{"request_id":"r1","metadata":{"user_api_key_alias":"litellm-internal-health-check"}}`,
+			want: true,
+		},
+		{
+			name: "service account api key alone",
+			raw:  `{"request_id":"r1","api_key":"litellm-internal-health-check","metadata":{}}`,
+			want: true,
+		},
+		{
+			name: "service account team alone",
+			raw:  `{"request_id":"r1","team_id":"litellm-internal-health-check","metadata":{}}`,
+			want: true,
+		},
+		{
+			name: "ordinary traffic",
+			raw:  `{"request_id":"chatcmpl-abc","call_type":"acompletion","api_key":"deadbeef","request_tags":["wiretap","benign"],"metadata":{"user_api_key_alias":"wiretap-main"}}`,
+			want: false,
+		},
+		{
+			name: "null everywhere",
+			raw:  `{"request_id":"r1","request_tags":null,"api_key":null,"team_id":null,"metadata":null}`,
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := ParseGatewayLine([]byte(tc.raw), 1)
+			if err != nil {
+				t.Fatalf("ParseGatewayLine: %v", err)
+			}
+			if ev.IsHealthCheck != tc.want {
+				t.Errorf("IsHealthCheck = %v, want %v", ev.IsHealthCheck, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseGatewayLine_NullTraceIDValueIsAbsent covers the nested form of
 // the null trap. spend_logs_metadata is map[string]json.RawMessage, so a
 // null *value* under the trace_id key yields the four bytes "null" rather

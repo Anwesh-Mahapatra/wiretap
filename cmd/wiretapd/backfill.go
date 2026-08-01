@@ -18,7 +18,7 @@ func cmdBackfill(args []string) error {
 	fs := flag.NewFlagSet("backfill", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "map and print documents instead of indexing them")
 	batchSize := fs.Int("batch-size", 100, "bulk indexing batch size")
-	skipHealthchecks := fs.Bool("skip-healthchecks", true, "drop litellm-internal-health-check events before indexing")
+	skipHealthchecks := fs.Bool("skip-healthchecks", true, "drop litellm-internal-health-check events, on both planes, before indexing")
 	logFormat := fs.String("log-format", "json", "log format: json or text")
 	sources := fs.String("sources", "langfuse,litellm", "comma-separated sources to replay: langfuse (content plane), litellm (gateway plane), or both")
 	if err := fs.Parse(args); err != nil {
@@ -60,7 +60,7 @@ func cmdBackfill(args []string) error {
 		targets = append(targets, target{
 			name: "litellm", archive: cfg.gatewayArchivePath, state: cfg.gatewayIndexStatePath,
 			index: cfg.gatewayIndexBase, deadLtr: cfg.gatewayDeadLetterPath,
-			ecs: cfg.gatewayECSConfig(), source: model.SourceLiteLLM, skipHC: false,
+			ecs: cfg.gatewayECSConfig(), source: model.SourceLiteLLM, skipHC: *skipHealthchecks,
 		})
 	}
 

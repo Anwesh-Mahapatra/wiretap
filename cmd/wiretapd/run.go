@@ -28,7 +28,7 @@ func cmdRun(args []string) error {
 	batchSize := fs.Int("batch-size", 100, "bulk indexing batch size")
 	flushInterval := fs.Duration("flush-interval", 10*time.Second, "how often the indexer scans the archive for new lines and flushes to elasticsearch")
 	fromStr := fs.String("from", "", "only fetch traces at or after this RFC3339 timestamp (first run only; ignored once a fetch checkpoint exists, and ignored entirely with --no-fetch)")
-	skipHealthchecks := fs.Bool("skip-healthchecks", true, "drop litellm-internal-health-check events before indexing -- wiretapd defaults this true, unlike tracepump, since it has an opinion about what belongs in Elasticsearch")
+	skipHealthchecks := fs.Bool("skip-healthchecks", true, "drop litellm-internal-health-check events, on both planes, before indexing -- wiretapd defaults this true, unlike tracepump, since it has an opinion about what belongs in Elasticsearch")
 	dryRun := fs.Bool("dry-run", false, "map and print documents instead of indexing them -- how a mapping change gets reviewed before it touches the index")
 	noEnrich := fs.Bool("no-enrich", false, "archive the raw list-shaped record instead of fetching full trace detail per new trace. Enrichment is on by default: it's what populates gen_ai.usage.*, gen_ai.request.model, gen_ai.response.model, and gen_ai.request.max_tokens (see internal/pipeline/enrich.go) -- with --no-enrich those fields stay permanently absent, same as before enrichment existed. Costs one extra bounded-concurrency Langfuse API call per new trace; turn it off only if that cost is the problem.")
 	logFormat := fs.String("log-format", "json", "log format: json or text")
@@ -77,7 +77,7 @@ func cmdRun(args []string) error {
 		planes = append(planes, pl)
 	}
 	if sel.litellm {
-		pl, err := newGatewayPlane(cfg, *batchSize, *dryRun, *noFetch, fromTime)
+		pl, err := newGatewayPlane(cfg, *batchSize, *skipHealthchecks, *dryRun, *noFetch, fromTime)
 		if err != nil {
 			return fmt.Errorf("gateway plane: %w", err)
 		}
@@ -251,7 +251,7 @@ func newContentPlane(cfg config, batchSize int, skipHealthchecks, dryRun, noFetc
 	return pl, nil
 }
 
-func newGatewayPlane(cfg config, batchSize int, dryRun, noFetch bool, fromTime time.Time) (*plane, error) {
+func newGatewayPlane(cfg config, batchSize int, skipHealthchecks, dryRun, noFetch bool, fromTime time.Time) (*plane, error) {
 	pl := &plane{name: "litellm"}
 	if !dryRun {
 		pl.sink = esink.NewBulkIndexer(cfg.esClient(), cfg.gatewayIndexBase,
@@ -261,9 +261,14 @@ func newGatewayPlane(cfg config, batchSize int, dryRun, noFetch bool, fromTime t
 	ix, err := pipeline.NewIndexer(pipeline.IndexConfig{
 		ArchivePath: cfg.gatewayArchivePath,
 		StatePath:   cfg.gatewayIndexStatePath,
-		// Health-check filtering is a Langfuse-tag concept; the gateway
-		// plane has no equivalent tag, so nothing is dropped here.
-		SkipHealthchecks: false,
+		// The same flag the content plane honours, on purpose: a health
+		// check produces a Langfuse trace *and* a spend row, and filtering
+		// one but not the other leaves the gateway index holding events
+		// with no possible partner and no join key -- a permanent nonzero
+		// floor under join health that has nothing to do with the join.
+		// LiteLLM marks both sides with the same literal; see
+		// parse.isGatewayHealthCheck.
+		SkipHealthchecks: skipHealthchecks,
 		DryRun:           dryRun,
 		ECS:              cfg.gatewayECSConfig(),
 		Source:           model.SourceLiteLLM,
@@ -275,9 +280,10 @@ func newGatewayPlane(cfg config, batchSize int, dryRun, noFetch bool, fromTime t
 
 	if !noFetch {
 		f, err := pipeline.NewGatewayFetcher(cfg.litellmClient(), pipeline.GatewayFetchConfig{
-			OutPath:   cfg.gatewayArchivePath,
-			StatePath: cfg.gatewayFetchStatePath,
-			From:      fromTime,
+			OutPath:          cfg.gatewayArchivePath,
+			StatePath:        cfg.gatewayFetchStatePath,
+			SkipHealthchecks: skipHealthchecks,
+			From:             fromTime,
 		})
 		if err != nil {
 			return nil, err

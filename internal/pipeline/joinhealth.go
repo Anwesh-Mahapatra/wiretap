@@ -125,6 +125,14 @@ type JoinHealthResult struct {
 	// trace.id at all. These are structurally uncorrelatable rather than
 	// unmatched, and are reported separately so they never inflate a rate
 	// whose denominator is "records that could have matched".
+	//
+	// LiteLLM's own health checks are the one source of these that is
+	// neither a real caller nor enumerable in the baseline -- they recur,
+	// so a new trace ID every time -- and they are excluded upstream by
+	// --skip-healthchecks rather than counted here. Without that, this
+	// number has a nonzero floor proportional to the health-check rate,
+	// which is exactly the kind of unexplained constant that trains
+	// whoever reads it to stop reading it.
 	GatewayDocsWithoutJoinKey int
 
 	// GatewayDocs is the raw document count, kept alongside GatewayTotal

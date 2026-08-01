@@ -449,9 +449,12 @@ where these live is now written down rather than rediscovered.
   trace is assumed to be a wiretap scenario or nothing; real traffic from
   another client is neither, which is handled (`Outcome` stays empty), but
   the naming reads as if wiretap is the only caller.
-- `internal/pipeline/fetch.go` — `healthCheckTag`, one tag identifying one
-  kind of synthetic traffic. A second health-check mechanism would not be
-  filtered.
+- `internal/pipeline/fetch.go` — `healthCheckTag`, one literal identifying
+  one kind of synthetic traffic. It is checked on both planes now (as a
+  Langfuse trace tag, and on a spend row as both `request_tags` and the
+  billed service-account identity), but it is still *one* mechanism: a
+  second kind of health check, or a LiteLLM release that renames the
+  constant, would not be filtered by either plane.
 - `internal/pipeline/fetch.go` — `OrderBy: "timestamp.asc"`, correct and
   load-bearing for checkpointing, but a single ordering assumed to be the
   only sensible one.

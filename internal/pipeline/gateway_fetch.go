@@ -48,6 +48,13 @@ type GatewayFetchConfig struct {
 	OutPath   string
 	StatePath string
 
+	// SkipHealthchecks drops LiteLLM's own health-check spend rows before
+	// they ever reach the archive -- the gateway-plane counterpart to
+	// FetchConfig.SkipHealthchecks, honouring the same --skip-healthchecks
+	// flag so the two planes cannot end up with different ideas of what
+	// counts as real traffic. See gatewayRecordCore.isHealthCheck.
+	SkipHealthchecks bool
+
 	// From seeds the checkpoint's cutoff, but only when the checkpoint is
 	// otherwise empty. A checkpoint that already has a cutoff always wins,
 	// so restarting with a stale --from can never rewind ingestion.
@@ -187,6 +194,22 @@ func (f *GatewayFetcher) PollOnce(ctx context.Context) (emitted, skipped int, er
 				continue
 			}
 
+			if f.cfg.SkipHealthchecks && core.isHealthCheck() {
+				// Marked seen and allowed to advance the cutoff, exactly as
+				// the content plane's fetcher treats a health-check trace:
+				// this is a permanent decision about the record, so there is
+				// nothing to gain from re-reading it on every poll inside
+				// the overlap window, and a quiet period carrying only
+				// health checks must still move the checkpoint forward.
+				skipped++
+				startTime := parseGatewayRecordTime(core.StartTime)
+				seen[core.RequestID] = startTime
+				if startTime.After(maxTime) {
+					maxTime = startTime
+				}
+				continue
+			}
+
 			if werr := f.out.WriteLine(raw); werr != nil {
 				return emitted, skipped, fmt.Errorf("archiving spend record %q: %w", core.RequestID, werr)
 			}
@@ -225,13 +248,53 @@ func (f *GatewayFetcher) PollOnce(ctx context.Context) (emitted, skipped int, er
 }
 
 // gatewayRecordCore is the minimum this stage needs to decide whether a
-// record is new and where it sits in time. Everything else stays
-// undecoded: the fetch stage archives bytes, it does not interpret them.
-// Interpretation is internal/parse's job, at replay time, so a mapper fix
-// months from now sees what the API actually said.
+// record is new, where it sits in time, and whether the opt-in
+// health-check filter applies. Everything else stays undecoded: the fetch
+// stage archives bytes, it does not interpret them. Interpretation is
+// internal/parse's job, at replay time, so a mapper fix months from now
+// sees what the API actually said.
+//
+// This mirrors traceCore on the content plane, including the fact that it
+// duplicates a decision internal/parse also makes: the fetch stage cannot
+// import that package's answer without importing its whole view of a
+// record, which is exactly the coupling the two-stage split exists to
+// avoid. Keep isHealthCheck below and parse.isGatewayHealthCheck in step.
 type gatewayRecordCore struct {
 	RequestID string `json:"request_id"`
 	StartTime string `json:"startTime"`
+
+	RequestTags []string `json:"request_tags"`
+	APIKey      string   `json:"api_key"`
+	TeamID      string   `json:"team_id"`
+	Metadata    struct {
+		UserAPIKey       string `json:"user_api_key"`
+		UserAPIKeyAlias  string `json:"user_api_key_alias"`
+		UserAPIKeyTeamID string `json:"user_api_key_team_id"`
+	} `json:"metadata"`
+}
+
+// isHealthCheck reports whether this record is one of LiteLLM's own model
+// health checks. See parse.isGatewayHealthCheck for the full account of
+// where each of these fields comes from and why the tag alone is not
+// enough; the short version is that LiteLLM stamps healthCheckTag onto a
+// health check both as a request tag and as the identity of the synthetic
+// service account it bills, and either stamp is sufficient evidence.
+func (c gatewayRecordCore) isHealthCheck() bool {
+	if hasTag(c.RequestTags, healthCheckTag) {
+		return true
+	}
+	for _, identity := range []string{
+		c.APIKey,
+		c.TeamID,
+		c.Metadata.UserAPIKey,
+		c.Metadata.UserAPIKeyAlias,
+		c.Metadata.UserAPIKeyTeamID,
+	} {
+		if identity == healthCheckTag {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGatewayRecordTime(s string) time.Time {
