@@ -227,7 +227,8 @@ func jsonPresent(raw json.RawMessage) bool {
 //
 // LiteLLM stamps a health check in two independent places, both with the
 // literal in healthCheckTag (verified against a live proxy and against
-// litellm/litellm_core_utils/health_check_helpers.py):
+// litellm/litellm_core_utils/health_check_helpers.py). They are not
+// equally trustworthy, which is what the choice below turns on:
 //
 //	_get_metadata_for_health_check_call
 //	  -> {"tags": [<sentinel>]}, which surfaces as request_tags on the
@@ -239,30 +240,52 @@ func jsonPresent(raw json.RawMessage) bool {
 //	     api_key, metadata.user_api_key, metadata.user_api_key_alias,
 //	     team_id and metadata.user_api_key_team_id
 //
-// Both are checked rather than just the tag, because they fail
-// differently. request_tags is caller-supplied: any client may pass that
-// tag in litellm_metadata, so it is not proof of provenance -- an exposure
-// the content plane already carries, inherited here rather than
-// introduced, and worth knowing about given that matching here *removes*
-// records from a security index. The service-account fields are the
-// proxy's own statement about who it billed and cannot be set by a caller.
-// Neither alone is both trustworthy and durable; together, a health check
-// still gets recognised if LiteLLM moves one of the two stamps.
+// Only the second stamp is trusted here. request_tags is caller-supplied
+// -- any client may put that literal in litellm_metadata -- and this
+// predicate *removes* records from a security index, so honouring the tag
+// on this plane would hand every caller a one-field opt-out from being
+// monitored. The service-account fields are the proxy's own statement
+// about which account it billed, and no caller can set them.
+//
+// This deliberately makes the two planes disagree about a *spoofed*
+// record, and that disagreement is the point. A genuine health check
+// carries both stamps, so both planes still drop it and the planes agree
+// on all real traffic. A forged one is dropped by the content plane, which
+// has only the tag to go on, and kept here -- so it lands in the gateway
+// index carrying its join key with no content partner, and surfaces as
+// gateway_unexplained rather than vanishing from both indices with join
+// health reporting all-clear. Requiring the tag as well, or accepting it
+// as sufficient, would close that window; an earlier revision of this
+// function accepted it as sufficient and did exactly that. See notes.md,
+// "A convenience change that closed a detection window nobody had named."
+//
+// The cost of ignoring the tag is that a LiteLLM release which moves the
+// service account without moving the tag would stop this filter working.
+// That failure is loud -- health-check rows return to the index with no
+// join key and gateway_docs_without_join_key climbs off zero -- whereas a
+// caller self-exempting from a security index is silent. Prefer the loud
+// failure.
 //
 // Nothing here keys on call_type: a health check is an ordinary
 // "acompletion", indistinguishable from real chat traffic on that field.
 func isGatewayHealthCheck(wr *wireSpendLog) bool {
-	if hasTag(wr.RequestTags, healthCheckTag) {
-		return true
-	}
-	for _, identity := range []string{
+	return isHealthCheckServiceAccount(
 		wr.APIKey,
 		wr.TeamID,
 		wr.Metadata.UserAPIKey,
 		wr.Metadata.UserAPIKeyAlias,
 		wr.Metadata.UserAPIKeyTeamID,
-	} {
-		if identity == healthCheckTag {
+	)
+}
+
+// isHealthCheckServiceAccount reports whether any of the identity fields
+// it is given names LiteLLM's internal health-check service account. Any
+// one of them is sufficient: they are all set from the same synthetic
+// UserAPIKeyAuth, so a record carrying one but not the others is LiteLLM
+// having moved a field, not a caller having forged one.
+func isHealthCheckServiceAccount(identities ...string) bool {
+	for _, id := range identities {
+		if id == healthCheckTag {
 			return true
 		}
 	}

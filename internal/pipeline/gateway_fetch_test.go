@@ -15,19 +15,30 @@ import (
 )
 
 // The records below are shaped like real /spend/logs/v2 rows, cut down to
-// the fields the fetch stage decodes. hcTagged and hcServiceAccount carry
-// one each of the two independent stamps LiteLLM puts on its own health
-// checks; production relies on either one being sufficient, so they are
-// exercised separately. See gatewayRecordCore.isHealthCheck.
+// the fields the fetch stage decodes.
+//
+// hcGenuine is what LiteLLM actually produces: both stamps, the request
+// tag and the billed service account. hcServiceAccount carries only the
+// second, and is still recognised -- the identity fields all come from one
+// synthetic UserAPIKeyAuth, so a record with one and not the others is
+// LiteLLM having moved a field. spoofedTag carries only the first, on
+// otherwise ordinary caller traffic, and must NOT be recognised: see
+// gatewayRecordCore.isHealthCheck.
 const (
 	hcStartTime = "2026-08-01T00:16:31.534+00:00"
 
-	hcTagged = `{"request_id":"hc1","startTime":"` + hcStartTime + `",` +
-		`"request_tags":["litellm-internal-health-check"],"metadata":{}}`
+	hcGenuine = `{"request_id":"hc1","startTime":"` + hcStartTime + `",` +
+		`"request_tags":["litellm-internal-health-check"],` +
+		`"api_key":"litellm-internal-health-check","team_id":"litellm-internal-health-check",` +
+		`"metadata":{"user_api_key":"litellm-internal-health-check",` +
+		`"user_api_key_alias":"litellm-internal-health-check","spend_logs_metadata":null}}`
 	hcServiceAccount = `{"request_id":"hc2","startTime":"2026-08-01T00:16:32.000+00:00",` +
 		`"api_key":"litellm-internal-health-check","metadata":` +
 		`{"user_api_key_alias":"litellm-internal-health-check"}}`
-	callerTraffic = `{"request_id":"chatcmpl-r1","startTime":"2026-08-01T00:16:33.000+00:00",` +
+	spoofedTag = `{"request_id":"chatcmpl-spoof","startTime":"2026-08-01T00:16:33.000+00:00",` +
+		`"request_tags":["litellm-internal-health-check"],"api_key":"deadbeef","metadata":` +
+		`{"spend_logs_metadata":{"trace_id":"benign-spoof"},"user_api_key_alias":"wiretap-main"}}`
+	callerTraffic = `{"request_id":"chatcmpl-r1","startTime":"2026-08-01T00:16:34.000+00:00",` +
 		`"request_tags":["wiretap","benign"],"api_key":"deadbeef","metadata":` +
 		`{"spend_logs_metadata":{"trace_id":"benign-1"},"user_api_key_alias":"wiretap-main"}}`
 )
@@ -68,31 +79,68 @@ func newGatewayFetcherForTest(t *testing.T, cfg GatewayFetchConfig, records ...s
 	return f
 }
 
+func archivedRequestIDs(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading archive: %v", err)
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		for _, want := range []string{"hc1", "hc2", "chatcmpl-spoof", "chatcmpl-r1"} {
+			if strings.Contains(line, `"request_id":"`+want+`"`) {
+				ids = append(ids, want)
+			}
+		}
+	}
+	return ids
+}
+
 // TestGatewayFetcher_SkipHealthchecks is the gateway-plane twin of
 // TestFetcher_SkipHealthchecks: LiteLLM's own health-check rows never
-// reach the archive, and real caller traffic in the same page is
-// unaffected.
+// reach the archive, and everything else in the same page does.
 func TestGatewayFetcher_SkipHealthchecks(t *testing.T) {
-	cfg := GatewayFetchConfig{SkipHealthchecks: true}
-	f := newGatewayFetcherForTest(t, cfg, hcTagged, hcServiceAccount, callerTraffic)
+	f := newGatewayFetcherForTest(t, GatewayFetchConfig{SkipHealthchecks: true},
+		hcGenuine, hcServiceAccount, spoofedTag, callerTraffic)
 
 	emitted, skipped, err := f.PollOnce(context.Background())
 	if err != nil {
 		t.Fatalf("PollOnce: %v", err)
 	}
-	if emitted != 1 || skipped != 2 {
-		t.Fatalf("PollOnce = emitted=%d skipped=%d, want 1/2 (both stamps recognised)", emitted, skipped)
+	if emitted != 2 || skipped != 2 {
+		t.Fatalf("PollOnce = emitted=%d skipped=%d, want 2/2", emitted, skipped)
 	}
 
-	data, err := os.ReadFile(f.cfg.OutPath)
+	got := archivedRequestIDs(t, f.cfg.OutPath)
+	want := []string{"chatcmpl-spoof", "chatcmpl-r1"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("archived %v, want %v", got, want)
+	}
+}
+
+// TestGatewayFetcher_SpoofedTagIsArchived is the whole point of keying on
+// the service account instead of the tag, and asserts a negative on
+// purpose.
+//
+// request_tags is caller-supplied. A record carrying the health-check tag
+// but billed to an ordinary key is not a health check -- it is a caller
+// claiming to be one -- and dropping it here would mean any client could
+// remove itself from a security index by naming a string. Keeping it is
+// also what makes the claim *visible*: the content plane, which has only
+// the trace tag to go on, does drop it, so the record lands here with a
+// join key and no content partner and surfaces as gateway_unexplained.
+func TestGatewayFetcher_SpoofedTagIsArchived(t *testing.T) {
+	f := newGatewayFetcherForTest(t, GatewayFetchConfig{SkipHealthchecks: true}, spoofedTag)
+
+	emitted, skipped, err := f.PollOnce(context.Background())
 	if err != nil {
-		t.Fatalf("reading archive: %v", err)
+		t.Fatalf("PollOnce: %v", err)
 	}
-	if strings.Contains(string(data), "litellm-internal-health-check") {
-		t.Error("archive contains a health-check record, want it dropped before it reached the archive")
-	}
-	if got := countLines(data); got != 1 {
-		t.Errorf("archive has %d lines, want 1", got)
+	if emitted != 1 || skipped != 0 {
+		t.Fatalf("PollOnce = emitted=%d skipped=%d, want 1/0 -- a caller-supplied tag must not be able to suppress a record", emitted, skipped)
 	}
 }
 
@@ -101,7 +149,7 @@ func TestGatewayFetcher_SkipHealthchecks(t *testing.T) {
 // it off the archive stays a faithful record of everything the API
 // returned.
 func TestGatewayFetcher_HealthchecksArchivedWhenFlagOff(t *testing.T) {
-	f := newGatewayFetcherForTest(t, GatewayFetchConfig{}, hcTagged)
+	f := newGatewayFetcherForTest(t, GatewayFetchConfig{}, hcGenuine)
 
 	emitted, _, err := f.PollOnce(context.Background())
 	if err != nil {
@@ -118,7 +166,7 @@ func TestGatewayFetcher_HealthchecksArchivedWhenFlagOff(t *testing.T) {
 // every subsequent poll, the same way the content plane's fetcher marks a
 // skipped health-check trace seen.
 func TestGatewayFetcher_SkippedHealthcheckStillAdvancesCheckpoint(t *testing.T) {
-	f := newGatewayFetcherForTest(t, GatewayFetchConfig{SkipHealthchecks: true}, hcTagged)
+	f := newGatewayFetcherForTest(t, GatewayFetchConfig{SkipHealthchecks: true}, hcGenuine)
 
 	if _, skipped, err := f.PollOnce(context.Background()); err != nil || skipped != 1 {
 		t.Fatalf("PollOnce = skipped=%d err=%v, want 1/nil", skipped, err)

@@ -39,10 +39,12 @@ const (
 	// on the gateway plane a permanent floor under join health's
 	// without-join-key count.
 	//
-	// One constant, both fetchers: LiteLLM stamps this same literal onto a
-	// health check as a request tag *and* as the identity of the service
-	// account it bills, so the content plane's tag test and the gateway
-	// plane's are the same test on the same fact. See
+	// One constant, both fetchers, but not the same test. LiteLLM stamps
+	// this literal onto a health check twice: as a request tag, which is
+	// all a Langfuse trace carries and is therefore what the content
+	// fetcher matches, and as the identity of the service account it
+	// bills, which is the only one of the two a caller cannot forge and is
+	// therefore all the gateway fetcher matches. See
 	// gatewayRecordCore.isHealthCheck.
 	healthCheckTag = "litellm-internal-health-check"
 )

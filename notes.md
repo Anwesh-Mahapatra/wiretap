@@ -1,6 +1,6 @@
 # Failure notes
 
-This file is a catalog of the eight distinct failure classes this project
+This file is a catalog of the nine distinct failure classes this project
 has actually hit, in the order they were discovered, plus the
 field-definition notes that predate them. Each class gets its own section
 below; this index exists so the pattern is visible before the detail.
@@ -65,10 +65,24 @@ change invalidates.
    wrong to catch. The audit habit is the only defence, and it applies to
    every dashboard, saved search, and index template too.*
 
+**Capability deleted by a correctness fix** — a defect was also, unnamed,
+the only witness to something worth keeping. Defence: before removing an
+asymmetry between two systems, ask what the asymmetry was detecting.
+
+9. **The detection window nobody had named** — filtering health checks on
+   the gateway plane the obvious way (match LiteLLM's marker wherever it
+   appears, including the caller-supplied tag) deleted an unnamed spoof
+   detection that existed only as a side effect of the two planes
+   disagreeing. *Nothing could have caught it as a defect: the tests were
+   green, the live behaviour was exactly as specified, and the detection
+   had never been written down anywhere to be invalidated. What caught it
+   was committing to a plain-language statement of the semantics — "either
+   alone is sufficient" — and someone reading that sentence.*
+
 Two honest footnotes to the pattern: "positive clauses degrade safely"
 holds for *matching* rules and fails for *aggregating* ones (fields that
 now exist on both planes double-count — class 8's entry carries the
-detail), and the recurring shape across all eight is a confident,
+detail), and the recurring shape across all nine is a confident,
 precise, wrong answer rather than an obviously broken one.
 
 ---
@@ -450,11 +464,12 @@ where these live is now written down rather than rediscovered.
   another client is neither, which is handled (`Outcome` stays empty), but
   the naming reads as if wiretap is the only caller.
 - `internal/pipeline/fetch.go` — `healthCheckTag`, one literal identifying
-  one kind of synthetic traffic. It is checked on both planes now (as a
-  Langfuse trace tag, and on a spend row as both `request_tags` and the
-  billed service-account identity), but it is still *one* mechanism: a
-  second kind of health check, or a LiteLLM release that renames the
-  constant, would not be filtered by either plane.
+  one kind of synthetic traffic. It is checked on both planes now, though
+  against different fields (a Langfuse trace tag on one, the billed
+  service-account identity on the other — see class 9 above for why), and
+  it is still *one* mechanism: a second kind of health check, or a LiteLLM
+  release that renames the constant, would not be filtered by either
+  plane.
 - `internal/pipeline/fetch.go` — `OrderBy: "timestamp.asc"`, correct and
   load-bearing for checkpointing, but a single ordering assumed to be the
   only sensible one.
@@ -704,3 +719,79 @@ Same-name-different-meaning is what makes a cross-plane aggregation
 produce a confident, precise, wrong number instead of an obviously broken
 one — the same failure shape as every other entry in this file, arrived
 at by arithmetic.
+
+### The detection window nobody had named (and the tidy change that closed it)
+
+The gateway plane didn't filter LiteLLM's own health checks; the content
+plane did. That asymmetry was a real defect — health-check spend rows
+carry no `spend_logs_metadata`, so every one of them sat in the gateway
+index with no join key, holding `gateway_docs_without_join_key` off zero
+forever. The fix is obvious and the brief was exactly right: apply the
+same filter, honour the same flag, make the two planes agree on what
+counts as real traffic.
+
+The obvious implementation is to match LiteLLM's marker wherever it
+appears. It stamps a health check twice with one literal — as a request
+tag, and as the identity of the synthetic service account it bills — so
+matching either is more robust than matching one: a LiteLLM release that
+moves a stamp doesn't break the filter. That is what shipped first.
+
+**What that quietly destroyed.** `request_tags` is caller-supplied. Any
+client could always put `litellm-internal-health-check` in its own
+`litellm_metadata` and disappear from the content index. Before the
+change, that spoof was *detectable*: the content plane dropped the trace,
+the gateway plane filtered nothing and kept the spend row, and the
+resulting one-sided record showed up as `gateway_unexplained` and tripped
+"join health degraded". After the change, the same forged request was
+dropped by both planes and join health reported all-clear. A one-field,
+no-credential opt-out from a security pipeline went from noisy to silent,
+inside a change whose entire purpose was to remove an inconsistency.
+
+**Why it was invisible.** Nobody had ever named that spoof as a detection.
+It had no rule in DETECTIONS.md, no test, no dashboard, no owner. Its only
+artifact was the disagreement between the two planes — which read as a
+bug, was written up as a bug, and was fixed as a bug. The capability
+existed solely as a side effect of the inconsistency, so it was
+undiscoverable right up until removing the inconsistency deleted it. There
+is no grep that finds a detection nobody wrote down.
+
+**What actually caught it** was prose, not behaviour. The tests were green
+and stayed green; the live verification showed both planes dropping their
+half of a genuine health check, which is precisely what was asked for. The
+tell was a sentence in the write-up — "either alone is sufficient" — and a
+reader asking which way the `OR` went and what it implied for the
+spoofable half. Committing to a plain-language statement of the semantics
+is what made the semantics reviewable. Behaviour that is only ever
+described as "it filters health checks" hides the question entirely.
+
+**The resolution.** The gateway plane now keys *only* on the billed
+service account, which no caller can set; the tag alone is explicitly not
+sufficient, with a test asserting the negative. The two planes are
+therefore back to disagreeing about a forged tag — deliberately this time,
+documented, and load-bearing. They still agree on every genuine health
+check, which was the actual goal.
+
+**The rule, in grep-able form:**
+
+> Prefer a loud failure over a durable one when the quiet failure is an
+> evasion.
+
+Keying only on the service account is the *less* durable choice: if
+LiteLLM moves that field, the filter stops working. But it fails loudly —
+health-check rows return to the index without join keys and
+`gateway_docs_without_join_key` climbs off zero, which is a number someone
+already watches. The durable choice fails silently, and its silence is
+someone else's exit. When the two failure modes are "we notice" and "an
+attacker gets a free pass", robustness is not the tiebreaker.
+
+**And the second-order rule, which is the one that generalises:**
+
+> Before removing an asymmetry between two systems, ask what the asymmetry
+> was detecting. Inconsistency is sometimes the only witness a capability
+> has.
+
+This is the same shape as "The artifact invalidated retroactively" above:
+the failure isn't in the change, it's in what the change silently
+invalidated. There the artifact was a document; here it was an emergent
+detection. Both were correct before the change, both were still *present*
+after it, and in neither case did anything fail.

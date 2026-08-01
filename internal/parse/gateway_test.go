@@ -460,15 +460,18 @@ func TestParseGatewayLine_HealthCheck(t *testing.T) {
 	}
 }
 
-// TestParseGatewayLine_HealthCheckStamps covers each of LiteLLM's two
-// independent stamps on its own, plus the negative case.
+// TestParseGatewayLine_HealthCheckStamps pins the asymmetry between
+// LiteLLM's two stamps.
 //
-// Both stamps are checked in production because they fail differently:
-// request_tags is caller-supplied and therefore spoofable, while the
-// service-account identity fields are the proxy's own statement about who
-// it billed. A record carrying either one alone must still be recognised,
-// or a future LiteLLM that moves one stamp silently reopens the join-health
-// floor this filter closed.
+// The "request tag alone" case is the load-bearing one, and it asserts a
+// *negative*: request_tags is caller-supplied, so a record carrying only
+// the tag is not evidence of a health check, it is evidence of something
+// claiming to be one. Honouring it would let any caller drop itself out of
+// a security index by naming a string. A forged tag instead leaves the
+// record here and removed on the content plane, and that disagreement is
+// what makes it show up as gateway_unexplained. An earlier revision
+// treated the tag as sufficient and silently closed that window; this test
+// is what stops it coming back.
 func TestParseGatewayLine_HealthCheckStamps(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -476,9 +479,16 @@ func TestParseGatewayLine_HealthCheckStamps(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "request tag alone",
+			name: "request tag alone is not sufficient",
 			raw:  `{"request_id":"r1","request_tags":["litellm-internal-health-check"],"metadata":{}}`,
-			want: true,
+			want: false,
+		},
+		{
+			name: "spoofed tag on otherwise ordinary caller traffic",
+			raw: `{"request_id":"chatcmpl-abc","call_type":"acompletion","api_key":"deadbeef",` +
+				`"request_tags":["litellm-internal-health-check"],"metadata":` +
+				`{"user_api_key_alias":"wiretap-main","spend_logs_metadata":{"trace_id":"benign-1"}}}`,
+			want: false,
 		},
 		{
 			name: "service account key alias alone",

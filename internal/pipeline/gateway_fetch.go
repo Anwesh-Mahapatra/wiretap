@@ -263,10 +263,12 @@ type gatewayRecordCore struct {
 	RequestID string `json:"request_id"`
 	StartTime string `json:"startTime"`
 
-	RequestTags []string `json:"request_tags"`
-	APIKey      string   `json:"api_key"`
-	TeamID      string   `json:"team_id"`
-	Metadata    struct {
+	// The identity of the account LiteLLM billed. request_tags is
+	// deliberately absent: it is caller-supplied, and this stage uses these
+	// fields to decide what never reaches the archive. See isHealthCheck.
+	APIKey   string `json:"api_key"`
+	TeamID   string `json:"team_id"`
+	Metadata struct {
 		UserAPIKey       string `json:"user_api_key"`
 		UserAPIKeyAlias  string `json:"user_api_key_alias"`
 		UserAPIKeyTeamID string `json:"user_api_key_team_id"`
@@ -274,15 +276,18 @@ type gatewayRecordCore struct {
 }
 
 // isHealthCheck reports whether this record is one of LiteLLM's own model
-// health checks. See parse.isGatewayHealthCheck for the full account of
-// where each of these fields comes from and why the tag alone is not
-// enough; the short version is that LiteLLM stamps healthCheckTag onto a
-// health check both as a request tag and as the identity of the synthetic
-// service account it bills, and either stamp is sufficient evidence.
+// health checks, judged only by the synthetic service account it was
+// billed to.
+//
+// LiteLLM also tags a health check with healthCheckTag, and the content
+// plane keys on exactly that tag -- but request_tags is caller-supplied,
+// so honouring it here would let any caller drop itself out of the archive
+// and out of Elasticsearch by naming the tag. The divergence that leaves
+// between the two planes is intentional and is what makes a forged tag
+// visible instead of silent. parse.isGatewayHealthCheck carries the full
+// argument, including why the resulting failure mode is the one to prefer;
+// keep the two in step.
 func (c gatewayRecordCore) isHealthCheck() bool {
-	if hasTag(c.RequestTags, healthCheckTag) {
-		return true
-	}
 	for _, identity := range []string{
 		c.APIKey,
 		c.TeamID,

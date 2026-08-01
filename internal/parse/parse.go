@@ -65,8 +65,14 @@ import (
 // synthetic service account the call is billed to, which is what reaches
 // the spend row. So the content plane matching a trace tag and the gateway
 // plane matching a spend record are matching the same fact from the same
-// source, not two conventions that happen to agree. See
-// isGatewayHealthCheck for the gateway-side fields.
+// source, not two conventions that happen to agree.
+//
+// The two planes deliberately match different stamps, though, because the
+// stamps are not equally trustworthy: a request tag is caller-supplied and
+// the service account is not. A Langfuse trace carries only the tag, so
+// this plane has no choice; the gateway plane does, and takes the other
+// one. See isGatewayHealthCheck, and docs/DETECTIONS.md for the gap that
+// leaves on this side.
 const healthCheckTag = "litellm-internal-health-check"
 
 // scenarioNamePrefix is how main.go names every trace it produces (see

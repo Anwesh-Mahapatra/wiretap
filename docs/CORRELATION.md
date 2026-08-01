@@ -223,9 +223,21 @@ off the gateway index. LiteLLM marks both sides with the same literal,
 `litellm-internal-health-check` — as a request tag (which reaches Langfuse
 as a trace tag and the spend row as `request_tags`) and as the identity of
 the synthetic service account it bills (`api_key`, `team_id`,
-`metadata.user_api_key{,_alias}`, `metadata.user_api_key_team_id`). Both
-are checked; `call_type` is not one of them, since a health check is an
-ordinary `acompletion`. See `parse.isGatewayHealthCheck`.
+`metadata.user_api_key{,_alias}`, `metadata.user_api_key_team_id`).
+`call_type` is neither, since a health check is an ordinary `acompletion`.
+
+**The two planes match different stamps, on purpose.** A Langfuse trace
+carries only the tag, so the content plane keys on it. The tag is
+caller-supplied, so the gateway plane does not: it keys on the service
+account, which no caller can set. A genuine health check carries both and
+is dropped by both, so the planes agree on all real traffic — they diverge
+only on a *forged* tag, which the content plane drops and the gateway
+plane keeps. That divergence is deliberate. It puts a spoofed record in
+the gateway index with a join key and no content partner, where it reads
+as `gateway_unexplained`, instead of letting it vanish from both indices
+with join health reporting all-clear. See `parse.isGatewayHealthCheck`,
+and the backlog entry in DETECTIONS.md for the exposure that remains on
+the content side.
 
 A non-zero rate is an incident, not a curiosity, and the runbook says so.
 

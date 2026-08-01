@@ -1058,3 +1058,28 @@ now. What genuinely remains:
   keyed on source IP for enforcement events is a rule that never fires.
 - **A real multi-model deployment** to demonstrate #7/#13 firing on a
   genuine routing anomaly rather than a described one.
+- **The content plane's health-check filter keys on something a caller
+  can set.** `--skip-healthchecks` drops any Langfuse trace tagged
+  `litellm-internal-health-check`, and that tag reaches Langfuse from the
+  caller's own `litellm_metadata`. So any client can exempt itself from
+  the content index by naming one string — no credential, no privilege,
+  one field. The gateway plane closed this by keying on the billed
+  service account instead (see `parse.isGatewayHealthCheck`), which is
+  why a forged tag now shows up as `gateway_unexplained` rather than
+  disappearing from both indices; a caller who tags every request is
+  currently invisible to every content-plane detection above while
+  remaining fully visible on the gateway.
+
+  Closing it means keying on something the caller cannot set. The trace
+  tag is the only health-check marker a Langfuse trace carries today, so
+  the options are all "get the untamperable fact from somewhere else":
+  correlate to the gateway row and take its verdict (works only for
+  requests that have a join key, which health checks do not); have the
+  enrichment step read the observation's LiteLLM metadata for the
+  service-account fields, if they survive into it — worth checking, and
+  the cheapest fix if they do; or treat the content plane's filter as
+  advisory and let the gateway plane be the sole authority on what is
+  synthetic, accepting the join-health noise that follows. Until one of
+  these lands, the honest statement is that the content plane's notion
+  of "not real traffic" is caller-assertable and the gateway plane's is
+  not.
