@@ -881,3 +881,64 @@ indices, zero violations. The eight Ollama documents now say `"ollama"`.
 And 151 documents whose only "evidence" had been the fallback — refused
 requests, which never reached a provider — now say `"unknown"`, which is
 what was always true of them.
+
+### The backlog guess that checked out (key identity does reach the content plane)
+
+Not every entry here is a failure. The DETECTIONS.md backlog has carried
+an item since the gateway plane landed: the content plane's health-check
+filter keys on a Langfuse trace tag that any caller can set, and the
+cheapest fix was listed as an unverified guess — "have the enrichment
+step read the observation's LiteLLM metadata for the service-account
+fields, *if they survive into it* — worth checking."
+
+Checked, against live Langfuse data during the garak investigation: they
+survive. Every LiteLLM-routed generation observation carries
+`metadata.user_api_key_alias`, and the observation itself is named
+`litellm:<alias>`. Both are set by the proxy from the *authenticated*
+credential — a caller can no more forge them than it can forge its own
+billing row — which is exactly the property the backlog item required.
+The mapper simply dropped them; nothing on the content plane surfaced
+them. (Surfacing `user_api_key_alias` onto content documents is the
+approved fix, scheduled separately: it adds `llm.key.*` to the content
+index, which is a template change and an index recreate, not a backfill.)
+
+Recorded for two reasons. First, closure: the guess is no longer a
+guess, and the backlog item's "worth checking" is answered. Second, the
+contrast is worth keeping in view — everywhere else in this repository a
+"should survive" assumption failed on contact with real data; this one
+held. The difference is that it was written down as a question, not
+shipped as an answer.
+
+### The static join key: the tempting fix that recreates the bug it bypasses
+
+garak speaks the OpenAI-compatible API and cannot set wiretap's join key
+(`metadata.spend_logs_metadata.trace_id` is set per request by
+cmd/wiretap). There is a tempting workaround, and it *works*: garak's
+generator config accepts `extra_body`, and a spend row verified live that
+`metadata.spend_logs_metadata.trace_id` smuggled this way reaches the
+gateway plane intact. The catch is that it can only be one constant —
+garak has no per-request templating — so the "fix" is thousands of attack
+requests sharing a single trace ID.
+
+That is the merged-traces bug from the top of this file, recreated
+deliberately and at industrial scale. Langfuse derives one trace per
+trace ID: every garak request would collapse into a single trace with
+hundreds of shuffled input/output pairs, unioned tags, and a latency
+spanning the whole scan; the gateway plane would hold thousands of spend
+rows all pointing at that one garbage trace. And the join would not fail
+— it would *succeed*, thousands of times, pairing every gateway row with
+whatever content the merged trace happened to hold. A join that always
+matches is worse than no join: its output is confident wrong pairs, which
+is precisely the failure this project already paid for once.
+
+The grep-able rule:
+
+> A join key shared by everything joins nothing.
+
+So the decision stands: garak traffic carries no join key, join health
+treats it as a *named expected-unmatched category* keyed on the
+proxy-asserted key alias (extending the join-baseline.json design rather
+than tolerating noise), and cross-plane detections (#9, #11, #12, #13,
+#14) are scored on garak traffic only if a per-request key ever becomes
+settable. Until then they are measured against the benign corpus and
+cmd/wiretap traffic, and the scorecard says so plainly.

@@ -114,6 +114,30 @@ for them too:
   rule runs against is a per-rule decision; the reasoning is recorded
   above rather than left implicit.
 
+### `gen_ai.system: "unknown"` is expected on enforcement events
+
+Since 2026-08-02, `gen_ai.system` is derived (the gateway's
+`custom_llm_provider`, else the served model's route prefix), and when
+*nothing* identifies a provider the field carries the literal `unknown` —
+never omitted, never a plausible guess (omission would let negative
+clauses match the gap; a plausible fallback is the bug this fixed — see
+notes.md, "The fallback that hid the gap it was covering").
+
+One population is *supposed* to have it: **refused requests**. A budget
+block, rate limit, or auth failure never reached a provider
+(`custom_llm_provider` is empty on real refusal spend rows, and nothing
+was served), so enforcement events say `unknown` on both planes. That
+was 151 documents at last reindex (76 content / 75 gateway). Anyone
+running the coverage audit `gen_ai.system: "unknown"` will see that
+number — it is correct, not a gap, and detections #8 and #15 pivot on
+exactly those events.
+
+A gap looks different: a `unknown` value on a **successful** request
+means a provider served a response this mapper didn't recognise — extend
+`litellmProviderToGenAISystem` (or its documented exception list) in
+`internal/ecs/provider.go`; `TestProviderTableCoversLiteLLMProviders` is
+the guard.
+
 ---
 
 ## 1. Canary token leaked in the model's output

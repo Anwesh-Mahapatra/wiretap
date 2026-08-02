@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -138,6 +139,15 @@ func main() {
 }
 
 func run() error {
+	// The target model is a runtime choice, not an edit: scenarios.json's
+	// defaults.model is the default, -model switches backend for one run
+	// (e.g. `-model local-llama` for volume against Ollama, `-model
+	// llama-3.3-70b-versatile` for a Groq spot-check). Editing the
+	// scenario file to switch backends was the working-tree hack this
+	// flag replaces.
+	modelFlag := flag.String("model", "", "LiteLLM model alias to send scenarios to; overrides scenarios.json's defaults.model")
+	flag.Parse()
+
 	if err := env.LoadDotEnv(defaultEnvFile); err != nil {
 		return err
 	}
@@ -152,9 +162,19 @@ func run() error {
 		return err
 	}
 
-	// LiteLLM proxies to Groq and reports telemetry to Langfuse itself
-	// (see litellm_settings.success_callback in config.yaml), so no Go-side
-	// tracing middleware is needed here anymore.
+	model := *modelFlag
+	if model == "" {
+		model = sf.Defaults.Model
+	}
+	if model == "" {
+		return fmt.Errorf("no target model: pass -model or set defaults.model in scenarios.json")
+	}
+	fmt.Printf("target model: %s (%d scenarios)\n", model, len(sf.Scenarios))
+
+	// LiteLLM proxies to the configured backends (see model_list in
+	// config.yaml) and reports telemetry to Langfuse itself (see
+	// litellm_settings.success_callback), so no Go-side tracing
+	// middleware is needed here anymore.
 	client := openai.NewClient(
 		option.WithBaseURL(env.OrDefault("LITELLM_BASE_URL", defaultLiteLLMURL)),
 		option.WithAPIKey(apiKey),
@@ -188,7 +208,7 @@ func run() error {
 		}
 
 		params := openai.ChatCompletionNewParams{
-			Model:    sf.Defaults.Model,
+			Model:    model,
 			Messages: messages,
 		}
 		if sc.MaxTokens != nil {
