@@ -1,6 +1,6 @@
 {
   "defaults": {
-    "model": "llama-3.3-70b-versatile",
+    "model": "local-llama",
     "userId": "anwesh-lab",
     "sessionId": "module4"
   },

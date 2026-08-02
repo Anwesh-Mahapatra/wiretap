@@ -22,7 +22,11 @@ type Config struct {
 
 	// GenAISystemFallback is what gen_ai.system falls back to when neither
 	// a gateway-reported provider nor a model-name route prefix
-	// identifies one.
+	// identifies one. It is emitted verbatim, so it must never be a
+	// plausible provider value -- DefaultGenAISystem ("unknown") is
+	// deliberately not one. Setting this to a real provider name
+	// re-creates the bug it fixes: every unrecognised provider then gets
+	// labelled as that provider, confidently and silently.
 	//
 	// It used to be named GenAISystem and was used unconditionally, which
 	// meant every document claimed "groq" whether or not Groq served it --
@@ -109,7 +113,17 @@ func buildGenAI(ev *model.LLMEvent, cfg Config) *genAI {
 		gatewayProvider = ev.Gateway.Provider
 		callType = ev.Gateway.CallType
 	}
-	system, _ := deriveGenAISystem(gatewayProvider, ev.ResponseModel, ev.RequestModel, cfg.GenAISystemFallback)
+	system, ok := deriveGenAISystem(gatewayProvider, ev.ResponseModel, ev.RequestModel)
+	if !ok {
+		// Nothing identified a provider. The fallback is applied HERE,
+		// at the call site, where applying it is a visible choice -- this
+		// line used to discard deriveGenAISystem's ok with `_`, storing
+		// the fallback as though it had been derived, which is how six
+		// Ollama-served documents came to claim "groq" on both planes.
+		// The fallback is "unknown" by default precisely so an
+		// unrecognised provider is grep-able rather than plausible.
+		system = cfg.GenAISystemFallback
+	}
 
 	g := &genAI{System: system}
 	if op := deriveOperation(callType, cfg.GenAIOperationFallback); op != "" {

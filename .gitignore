@@ -4,6 +4,7 @@ api_key
 /data/
 *-state.json
 dead-letter*.json
+.garak-venv
 
 # Stray binaries from an accidental `go build ./...` at the repo root
 # (this has happened before -- see git history) -- one per cmd/ package.

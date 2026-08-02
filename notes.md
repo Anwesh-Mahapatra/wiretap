@@ -795,3 +795,89 @@ the failure isn't in the change, it's in what the change silently
 invalidated. There the artifact was a document; here it was an emergent
 detection. Both were correct before the change, both were still *present*
 after it, and in neither case did anything fail.
+
+### The fallback that hid the gap it was covering (gen_ai.system, again)
+
+The "constant standing in for a value with no second example" entry above
+ends with a fix: derive `gen_ai.system` from the gateway's
+`custom_llm_provider` or the model-name route prefix, keep `"groq"` only
+as a fallback. That fix shipped, was tested, was reviewed — and the first
+time a second provider actually appeared (an `ollama_chat/llama3.1:8b`
+entry in `config.yaml`), eight documents were indexed with
+`gen_ai.system: "groq"` on both planes anyway. Nothing failed. A human
+reading documents noticed.
+
+The mechanism was new, and worth separating into its three parts.
+
+**1. The derivation inherited the constant as its fallback.** The table
+`litellmProviderToGenAISystem` had fourteen entries; `ollama` and
+`ollama_chat` were not among them. A lookup that missed did not produce an
+absence — it produced the old constant. So the constant was replaced by a
+derivation, the derivation kept the constant as its default, and the
+original failure mode survived the fix intact. This is the same family as
+the constants entry but a distinct mechanism: there, a literal was wrong
+when the world changed; here, a *correct-looking derivation* was wrong
+when its table was incomplete, because its default converted the gap into
+a plausible value. The grep-able rule:
+
+> A fallback that returns a plausible value hides the gap it is covering.
+
+**2. A safety return that no caller consumes is not a safety mechanism.**
+`deriveGenAISystem` was *designed* for this case. It returned
+`(system, ok)`, and its doc comment said callers that would rather emit
+nothing than emit a guess could tell the difference. The single call site
+was `system, _ := deriveGenAISystem(...)`. The guard existed, was
+documented, and was discarded exactly where it mattered — and the compiler
+cannot help, because discarding a return with `_` is legal and
+intentional-looking. The fix moves the fallback to the call site
+(`if !ok { system = cfg.GenAISystemFallback }`), so leaving it out is no
+longer something that can happen silently. If a function returns a
+boolean meaning "I am not sure", grep for every call site before
+believing it protects anything.
+
+**3. The derivation was validated against its output vocabulary, never
+its input domain.** `TestGenAISystemValuesAreInTheOTelVocabulary` checked
+that every value the table could *emit* was a legal OpenTelemetry
+identifier. Nothing checked that the table's *keys* covered the prefixes
+LiteLLM actually emits — 149 values in the `LlmProviders` enum, of which
+the table covered 14. Every test fixture used an invented model string,
+so no real prefix ever reached the table. The output side of a mapping
+being spec-correct says nothing about the input side being complete; both
+need a test. The input side now has one:
+`TestProviderTableCoversLiteLLMProviders` runs a committed snapshot of
+the enum (`internal/ecs/testdata/litellm-providers.txt`, refreshed on
+each LiteLLM upgrade) against the table plus a documented
+deliberately-unmapped exception list, so a LiteLLM upgrade that adds a
+provider fails CI until a human decides its mapping.
+
+Two subsidiary findings, recorded because they generalise:
+
+- **A test that forbids what the standard permits blocks the correct fix
+  and reads as authoritative while doing it.** The vocabulary test
+  rejected any value outside the well-known list; the registry's actual
+  rule is that a custom value MAY be used when no well-known value
+  applies. Under the old test, mapping `ollama_chat` to `"ollama"` — the
+  spec-sanctioned fix — failed CI. The test now encodes the real rule:
+  well-known where one applies, justified custom otherwise, and the
+  fallback itself must *not* be a plausible provider value (the check is
+  deliberately inverted from the original).
+- **Omitting the field would have reopened the negative-clause trap.**
+  The alternative to the `"unknown"` marker was emitting no
+  `gen_ai.system` at all. But a document *lacking* the field matches
+  `NOT gen_ai.system: "groq"` — the class 7/8 lesson that presence and
+  absence change what negative clauses mean as data shape changes. The
+  marker keeps the field's domain total: every document has a value, no
+  value is a lie, and `gen_ai.system: "unknown"` is a one-line coverage
+  audit instead of an `exists` query nobody schedules.
+
+The repair, for the record: table gained the self-hosted group (`ollama`,
+`ollama_chat`, `vllm`, `hosted_vllm`, `lm_studio`, `llamafile`,
+`openrouter`, `together_ai` — the plausible next backends for this
+deployment, mapped to spec-legal custom values); the fallback became
+`"unknown"`; the archive was replayed. Every document that carried Groq
+*evidence* (a `groq/` prefix or `custom_llm_provider: groq`) still says
+`"groq"` — verified per-document against a pre-reindex snapshot of both
+indices, zero violations. The eight Ollama documents now say `"ollama"`.
+And 151 documents whose only "evidence" had been the fallback — refused
+requests, which never reached a provider — now say `"unknown"`, which is
+what was always true of them.

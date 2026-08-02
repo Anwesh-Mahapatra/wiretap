@@ -27,7 +27,7 @@
     "operation": {
       "name": "chat"
     },
-    "system": "groq",
+    "system": "unknown",
     "request": {
       "model": "llama-3.3-70b-versatile"
     }

@@ -3,18 +3,26 @@ package ecs
 import "strings"
 
 // DefaultGenAISystem is what gen_ai.system falls back to when nothing in
-// the event identifies a provider -- no gateway-reported provider, and a
-// model name carrying no LiteLLM route prefix.
+// the event identifies a provider -- no gateway-reported provider, and no
+// model-name route prefix the table recognises.
 //
-// It is a fallback, not an answer. It exists because this deployment does
-// route every request to Groq today (see config.yaml), so a bare model
-// name like "llama-3.3-70b-versatile" really did come from Groq -- but the
-// day config.yaml gains a second model_list entry, that stops being true,
-// and this constant becomes the wrong answer for every request the second
-// provider serves. Derivation is tried first for exactly that reason; see
-// deriveGenAISystem and notes.md's entry on constants standing in for
-// values with no second example.
-const DefaultGenAISystem = "groq"
+// It is deliberately NOT a plausible provider value. This constant used to
+// be "groq", on the grounds that this deployment routed everything to Groq
+// -- which turned every unrecognised provider into a confident wrong
+// answer the day config.yaml gained a second model_list entry: six
+// Ollama-served documents labelled "groq" on both planes, caught only
+// because a human read them (see notes.md). A fallback that returns a
+// plausible value hides the gap it is covering: nothing ever looks wrong,
+// so nobody looks. "unknown" cannot be mistaken for data, is grep-able as
+// a coverage audit (`gen_ai.system: "unknown"` lists every gap), and keeps
+// the field present on every document -- omitting it would let
+// `NOT gen_ai.system: X` clauses silently match the gaps instead.
+//
+// The value is spec-legal: the OpenTelemetry registry's rule for
+// gen_ai.system is that a well-known value MUST be used where one applies,
+// and a custom value MAY be used otherwise. No well-known value means
+// "this mapper could not identify a provider", so a custom one it is.
+const DefaultGenAISystem = "unknown"
 
 // litellmProviderToGenAISystem maps LiteLLM's route prefix -- the part
 // before the slash in a model string like "groq/llama-3.3-70b-versatile"
@@ -60,6 +68,24 @@ var litellmProviderToGenAISystem = map[string]string{
 	"vertex_ai":  "gcp.vertex_ai",
 	"watsonx":    "ibm.watsonx.ai",
 	"xai":        "xai",
+
+	// Self-hosted and open-weight serving -- the plausible next backends
+	// for this deployment. No OTel well-known value applies to any of
+	// these, so the mapped values are the custom values the spec permits
+	// (a well-known value MUST be used where one applies; otherwise a
+	// custom value MAY be used). They name the serving *product* and
+	// collapse LiteLLM's route variants: ollama_chat is Ollama's chat
+	// endpoint and hosted_vllm a remote vLLM server -- same product,
+	// reached differently. "ollama" in particular is the entry whose
+	// absence labelled six Ollama-served documents "groq".
+	"ollama":      "ollama",
+	"ollama_chat": "ollama",
+	"vllm":        "vllm",
+	"hosted_vllm": "vllm",
+	"lm_studio":   "lm_studio",
+	"llamafile":   "llamafile",
+	"openrouter":  "openrouter",
+	"together_ai": "together_ai",
 }
 
 // deriveGenAISystem resolves gen_ai.system from the best evidence
@@ -71,12 +97,16 @@ var litellmProviderToGenAISystem = map[string]string{
 //  2. The route prefix on a model name, e.g. "groq/llama-3.3-70b-versatile".
 //     This is all the content plane ever has, and real captured Langfuse
 //     data does carry the prefix on successful generations.
-//  3. The caller-supplied fallback.
 //
-// ok reports whether a *recognised* provider was identified. It is false
-// when the fallback was used, so callers that would rather emit nothing
-// than emit a guess can tell the difference.
-func deriveGenAISystem(gatewayProvider, responseModel, requestModel, fallback string) (system string, ok bool) {
+// ok is false when nothing recognised a provider, and system is then "".
+// The function does NOT apply a fallback: it used to take one as a
+// parameter and return it with ok=false, and the single call site
+// discarded the ok with `_` -- storing the fallback as though it had been
+// derived. A safety return no caller consumes is not a safety mechanism,
+// and the compiler cannot help: discarding a return with _ is legal and
+// intentional-looking. The fallback therefore now lives at the call site
+// (buildGenAI), where leaving it out is impossible to do silently.
+func deriveGenAISystem(gatewayProvider, responseModel, requestModel string) (system string, ok bool) {
 	if s, found := litellmProviderToGenAISystem[strings.ToLower(strings.TrimSpace(gatewayProvider))]; found {
 		return s, true
 	}
@@ -88,7 +118,7 @@ func deriveGenAISystem(gatewayProvider, responseModel, requestModel, fallback st
 			return s, true
 		}
 	}
-	return fallback, false
+	return "", false
 }
 
 // providerFromModelPrefix extracts the LiteLLM route prefix from a model

@@ -22,7 +22,7 @@ import (
 const (
 	defaultLiteLLMURL = "http://localhost:4000"
 	defaultEnvFile    = ".env"
-	requestTimeout    = 30 * time.Second
+	requestTimeout    = 120 * time.Second
 )
 
 type scenarioMessage struct {

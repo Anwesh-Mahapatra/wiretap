@@ -180,9 +180,11 @@ func TestMap_NoGenAIFieldEmittedAsZeroSubstituteForMissing(t *testing.T) {
 			t.Errorf("document JSON contains %s, which should be entirely absent, not zero-valued: %s", forbidden, raw)
 		}
 	}
-	// System/Operation, by contrast, ARE always known for this deployment
-	// and should always be present.
-	if !bytes.Contains(raw, []byte(`"system":"groq"`)) {
+	// System/Operation, by contrast, ARE always present -- the guarantee is
+	// presence, not a particular value. With no provider evidence on the
+	// event, System is the fallback marker (DefaultGenAISystem), which is
+	// precisely not a plausible provider.
+	if !bytes.Contains(raw, []byte(`"system":"`+DefaultGenAISystem+`"`)) {
 		t.Errorf("document JSON is missing gen_ai.system: %s", raw)
 	}
 }
